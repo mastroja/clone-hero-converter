@@ -1,16 +1,32 @@
 #!/usr/bin/env python
-"""Clone Hero Converter: desktop GUI for stem separation and MIDI conversion."""
+"""Clone Hero Converter: drop in a song, get a Clone Hero song folder."""
 import json
+import os
 import queue
+import shutil
+import sys
 import threading
-import tkinter as tk
+import traceback
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
 
-import midi_to_ch
-import separate
+import customtkinter as ctk
+from tkinterdnd2 import DND_FILES, TkinterDnD
+
+from chc import pipeline
+
+try:
+    import winsound
+except ImportError:  # non-Windows: previews disabled
+    winsound = None
 
 CONFIG = Path.home() / ".clone_hero_converter.json"
+AUDIO_EXT = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".opus", ".aac", ".wma"}
+ACCENT = "#7c5cff"
+ACCENT_HOVER = "#6a49ec"
+GOOD = "#35c486"
+MUTED = ("#6b7280", "#9aa0ad")
+CARD = ("#eef0f6", "#1d2030")
+CARD_HOVER = ("#e2e5f0", "#262a3f")
 
 
 def load_config() -> dict:
@@ -27,260 +43,307 @@ def save_config(cfg: dict) -> None:
         pass
 
 
-class LogBox(ttk.Frame):
-    """Read-only log; lines flagged progress replace the previous progress line."""
-
-    def __init__(self, master):
-        super().__init__(master)
-        self.text = tk.Text(self, height=12, state="disabled", wrap="word")
-        sb = ttk.Scrollbar(self, command=self.text.yview)
-        self.text.configure(yscrollcommand=sb.set)
-        self.text.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        self._last_progress = False
-
-    def write(self, msg, progress=False):
-        t = self.text
-        t.configure(state="normal")
-        if self._last_progress:
-            t.delete("end-2l", "end-1l")
-        t.insert("end", msg + "\n")
-        t.see("end")
-        t.configure(state="disabled")
-        self._last_progress = progress
+def default_songs_dir() -> Path:
+    return Path.home() / "Documents" / "Clone Hero" / "Songs"
 
 
-def path_row(parent, row, label, var, browse):
-    ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=3)
-    ttk.Entry(parent, textvariable=var).grid(row=row, column=1, sticky="ew", padx=6)
-    ttk.Button(parent, text="Browse...", command=browse).grid(row=row, column=2)
-
-
-class SeparateTab(ttk.Frame):
-    def __init__(self, master, app):
-        super().__init__(master, padding=10)
-        self.app = app
-        self.files: list[Path] = []
-        self.stop = threading.Event()
-        self.q: queue.Queue = queue.Queue()
-        self.columnconfigure(1, weight=1)
-
-        self.out = tk.StringVar(value=app.cfg.get("songs_dir", ""))
-        self.model = tk.StringVar(value=app.cfg.get("model", "htdemucs_ft"))
-        self.device = tk.StringVar(value=app.cfg.get("device", "cuda"))
-        self.charter = tk.StringVar(value=app.cfg.get("charter", ""))
-        self.force = tk.BooleanVar()
-
-        bar = ttk.Frame(self)
-        bar.grid(row=0, column=0, columnspan=3, sticky="ew")
-        ttk.Button(bar, text="Add files...", command=self.add_files).pack(side="left")
-        ttk.Button(bar, text="Add folder...", command=self.add_folder).pack(side="left", padx=6)
-        ttk.Button(bar, text="Remove selected", command=self.remove).pack(side="left")
-        ttk.Button(bar, text="Clear", command=self.clear).pack(side="left", padx=6)
-
-        self.listbox = tk.Listbox(self, height=7, selectmode="extended")
-        self.listbox.grid(row=1, column=0, columnspan=3, sticky="nsew", pady=6)
-        self.rowconfigure(1, weight=1)
-
-        path_row(self, 2, "Songs folder:", self.out, self.pick_out)
-        opts = ttk.Frame(self)
-        opts.grid(row=3, column=0, columnspan=3, sticky="w", pady=4)
-        ttk.Label(opts, text="Model:").pack(side="left")
-        ttk.Combobox(opts, textvariable=self.model, width=14,
-                     values=["htdemucs_ft", "htdemucs", "htdemucs_6s", "mdx_extra"]).pack(side="left", padx=4)
-        ttk.Label(opts, text="Device:").pack(side="left", padx=(10, 0))
-        ttk.Combobox(opts, textvariable=self.device, width=6, values=["cuda", "cpu"],
-                     state="readonly").pack(side="left", padx=4)
-        ttk.Label(opts, text="Charter:").pack(side="left", padx=(10, 0))
-        ttk.Entry(opts, textvariable=self.charter, width=16).pack(side="left", padx=4)
-        ttk.Checkbutton(opts, text="Redo existing", variable=self.force).pack(side="left", padx=10)
-
-        run = ttk.Frame(self)
-        run.grid(row=4, column=0, columnspan=3, sticky="ew")
-        self.go = ttk.Button(run, text="Separate stems", command=self.start)
-        self.go.pack(side="left")
-        self.cancel = ttk.Button(run, text="Cancel", command=self.stop.set, state="disabled")
-        self.cancel.pack(side="left", padx=6)
-        self.status = ttk.Label(run, text="")
-        self.status.pack(side="left", padx=10)
-        self.bar = ttk.Progressbar(self, mode="determinate")
-        self.bar.grid(row=5, column=0, columnspan=3, sticky="ew", pady=6)
-        self.log = LogBox(self)
-        self.log.grid(row=6, column=0, columnspan=3, sticky="nsew")
-        self.rowconfigure(6, weight=2)
-
-    def refresh(self):
-        self.listbox.delete(0, "end")
-        for f in self.files:
-            self.listbox.insert("end", f.name)
-
-    def add_files(self):
-        for f in filedialog.askopenfilenames(
-                filetypes=[("Audio", "*.mp3 *.wav *.flac *.ogg *.m4a *.opus"), ("All", "*.*")]):
-            if Path(f) not in self.files:
-                self.files.append(Path(f))
-        self.refresh()
-
-    def add_folder(self):
-        d = filedialog.askdirectory()
-        if d:
-            self.files += [f for f in separate.collect_audio(Path(d)) if f not in self.files]
-            self.refresh()
-
-    def remove(self):
-        for i in reversed(self.listbox.curselection()):
-            del self.files[i]
-        self.refresh()
-
-    def clear(self):
-        self.files.clear()
-        self.refresh()
-
-    def pick_out(self):
-        d = filedialog.askdirectory()
-        if d:
-            self.out.set(d)
-
-    def start(self):
-        if not self.files:
-            return messagebox.showinfo("Nothing to do", "Add at least one audio file.")
-        if not self.out.get():
-            return messagebox.showinfo("Songs folder", "Choose where song folders should go.")
-        self.app.cfg.update(songs_dir=self.out.get(), model=self.model.get(),
-                            device=self.device.get(), charter=self.charter.get())
-        save_config(self.app.cfg)
-        self.stop.clear()
-        self.go.configure(state="disabled")
-        self.cancel.configure(state="normal")
-        self.bar.configure(maximum=len(self.files), value=0)
-        files, args = list(self.files), (Path(self.out.get()), self.model.get(),
-                                         self.device.get(), self.charter.get(), self.force.get())
-
-        def work():
-            fails = separate.run_batch(
-                files, *args, log=lambda m, progress=False: self.q.put(("log", m, progress)),
-                stop=self.stop, on_item=lambda i, n, name: self.q.put(("item", i, n, name)))
-            self.q.put(("done", fails))
-
-        threading.Thread(target=work, daemon=True).start()
-        self.after(100, self.poll)
-
-    def poll(self):
-        try:
-            while True:
-                msg = self.q.get_nowait()
-                if msg[0] == "log":
-                    self.log.write(msg[1], msg[2])
-                elif msg[0] == "item":
-                    self.bar.configure(value=msg[1])
-                    self.status.configure(text=f"{msg[1] + 1 if msg[3] else msg[1]}/{msg[2]} {msg[3]}")
-                else:
-                    self.go.configure(state="normal")
-                    self.cancel.configure(state="disabled")
-                    self.status.configure(text=f"Finished, {msg[1]} failed" if msg[1] else "Finished")
-                    return
-        except queue.Empty:
-            pass
-        self.after(100, self.poll)
-
-
-class ConvertTab(ttk.Frame):
-    def __init__(self, master, app):
-        super().__init__(master, padding=10)
-        self.app = app
-        self.columnconfigure(1, weight=1)
-        self.src = tk.StringVar()
-        self.dest = tk.StringVar()
-        self.inst = tk.StringVar(value="guitar")
-        self.track = tk.StringVar(value="(busiest)")
-        self.mode = tk.StringVar(value="quantile")
-        self.gap = tk.DoubleVar(value=0.125)
-        self.sus = tk.BooleanVar()
-
-        path_row(self, 0, "Source MIDI:", self.src, self.pick_src)
-        path_row(self, 1, "Output notes.mid:", self.dest, self.pick_dest)
-        ttk.Button(self, text="Use a song folder...", command=self.pick_song).grid(
-            row=2, column=1, sticky="w", padx=6)
-
-        f = ttk.LabelFrame(self, text="Options", padding=8)
-        f.grid(row=3, column=0, columnspan=3, sticky="ew", pady=8)
-        ttk.Label(f, text="Instrument:").grid(row=0, column=0, sticky="w")
-        ttk.Combobox(f, textvariable=self.inst, values=list(midi_to_ch.TRACK_NAMES),
-                     state="readonly", width=10).grid(row=0, column=1, padx=6, pady=3)
-        ttk.Label(f, text="Source track:").grid(row=0, column=2, padx=(14, 0))
-        self.track_box = ttk.Combobox(f, textvariable=self.track, values=["(busiest)"],
-                                      state="readonly", width=34)
-        self.track_box.grid(row=0, column=3, padx=6)
-        ttk.Label(f, text="Lane mode:").grid(row=1, column=0, sticky="w")
-        ttk.Combobox(f, textvariable=self.mode, values=["quantile", "contour", "single"],
-                     state="readonly", width=10).grid(row=1, column=1, padx=6, pady=3)
-        ttk.Label(f, text="Min gap (beats):").grid(row=1, column=2, padx=(14, 0))
-        ttk.Spinbox(f, from_=0, to=2, increment=0.0625, textvariable=self.gap,
-                    width=8).grid(row=1, column=3, sticky="w", padx=6)
-        ttk.Checkbutton(f, text="Keep sustains (guitar/bass)", variable=self.sus).grid(
-            row=2, column=0, columnspan=3, sticky="w")
-        ttk.Label(f, text="quantile = spread by pitch, contour = follow up/down movement, "
-                          "single = all green", foreground="gray").grid(
-            row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
-
-        ttk.Button(self, text="Convert", command=self.run).grid(row=4, column=0, sticky="w")
-        self.log = LogBox(self)
-        self.log.grid(row=5, column=0, columnspan=3, sticky="nsew", pady=8)
-        self.rowconfigure(5, weight=1)
-
-    def pick_src(self):
-        f = filedialog.askopenfilename(filetypes=[("MIDI", "*.mid *.midi"), ("All", "*.*")])
-        if not f:
-            return
-        self.src.set(f)
-        if not self.dest.get():
-            self.dest.set(str(Path(f).with_name("notes.mid")))
-        try:
-            tracks = midi_to_ch.list_tracks(f)
-        except Exception as e:  # unreadable MIDI
-            return messagebox.showerror("MIDI error", str(e))
-        self.track_box.configure(values=["(busiest)"] + [f"{i}: {n or '(unnamed)'} ({c} notes)"
-                                                         for i, n, c in tracks])
-        self.track.set("(busiest)")
-
-    def pick_dest(self):
-        f = filedialog.asksaveasfilename(defaultextension=".mid", initialfile="notes.mid",
-                                         filetypes=[("MIDI", "*.mid")])
-        if f:
-            self.dest.set(f)
-
-    def pick_song(self):
-        d = filedialog.askdirectory(initialdir=self.app.cfg.get("songs_dir") or None)
-        if d:
-            self.dest.set(str(Path(d) / "notes.mid"))
-
-    def run(self):
-        if not self.src.get():
-            return messagebox.showinfo("Source MIDI", "Choose a source MIDI file.")
-        sel = self.track.get()
-        track = None if sel == "(busiest)" else sel.split(":")[0]
-        try:
-            dest, n = midi_to_ch.convert(
-                self.src.get(), self.dest.get() or None, self.inst.get(), track,
-                self.mode.get(), float(self.gap.get()), self.sus.get())
-        except (SystemExit, Exception) as e:
-            self.log.write(f"FAILED: {e}")
-            return messagebox.showerror("Conversion failed", str(e))
-        self.log.write(f"Wrote {dest}\n{n} notes on {midi_to_ch.TRACK_NAMES[self.inst.get()]}. "
-                       "Open it in Moonscraper (Load) to set BPM markers and offset.")
-
-
-class App(tk.Tk):
+class App(ctk.CTk, TkinterDnD.DnDWrapper):
     def __init__(self):
         super().__init__()
+        self.TkdndVersion = TkinterDnD._require(self)
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("dark-blue")
         self.title("Clone Hero Converter")
-        self.geometry("760x620")
+        self.geometry("820x640")
+        self.minsize(720, 580)
         self.cfg = load_config()
-        nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True, padx=6, pady=6)
-        nb.add(SeparateTab(nb, self), text="1. Separate stems")
-        nb.add(ConvertTab(nb, self), text="2. Convert MIDI")
+        self.songs_dir = Path(self.cfg.get("songs_dir") or default_songs_dir())
+        self.src: Path | None = None
+        self.stop = threading.Event()
+        self.result: pipeline.Result | None = None
+        self.playing: str | None = None
+        self.play_buttons: dict = {}
+        self.view: ctk.CTkFrame | None = None
+        self.q: queue.Queue = queue.Queue()
+
+        self.drop_target_register(DND_FILES)
+        self.dnd_bind("<<Drop>>", self.on_drop)
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.show_home()
+        self.drain()
+
+    # ---------- view switching ----------
+    def switch(self, frame: ctk.CTkFrame):
+        if self.view is not None:
+            self.view.destroy()
+        self.view = frame
+        frame.pack(fill="both", expand=True, padx=28, pady=24)
+
+    def header(self, parent, title, subtitle=""):
+        ctk.CTkLabel(parent, text=title, font=ctk.CTkFont(size=28, weight="bold")).pack(anchor="w")
+        if subtitle:
+            ctk.CTkLabel(parent, text=subtitle, text_color=MUTED, font=ctk.CTkFont(size=14),
+                         wraplength=720, justify="left").pack(anchor="w", pady=(2, 14))
+
+    # ---------- home ----------
+    def show_home(self):
+        self.stop_audio()
+        f = ctk.CTkFrame(self, fg_color="transparent")
+        self.header(f, "Clone Hero Converter",
+                    "Drop in a song and get a ready-to-play Clone Hero chart, split into "
+                    "guitar, bass, drums and vocals.")
+        self.drop = ctk.CTkFrame(f, fg_color=CARD, corner_radius=18, border_width=2,
+                                 border_color=ACCENT, height=190)
+        self.drop.pack(fill="x")
+        self.drop.pack_propagate(False)
+        self.drop_title = ctk.CTkLabel(self.drop, text="Drop an MP3 or WAV file here",
+                                       font=ctk.CTkFont(size=22, weight="bold"))
+        self.drop_title.pack(pady=(52, 2))
+        self.drop_sub = ctk.CTkLabel(self.drop, text="or click to choose a file", text_color=MUTED)
+        self.drop_sub.pack()
+        for w in (self.drop, self.drop_title, self.drop_sub):
+            w.bind("<Button-1>", lambda e: self.browse())
+            w.configure(cursor="hand2")
+        self.drop.drop_target_register(DND_FILES)
+        self.drop.dnd_bind("<<Drop>>", self.on_drop)
+
+        form = ctk.CTkFrame(f, fg_color="transparent")
+        form.pack(fill="x", pady=(18, 0))
+        form.columnconfigure((0, 1), weight=1, uniform="c")
+        ctk.CTkLabel(form, text="Artist", text_color=MUTED).grid(row=0, column=0, sticky="w")
+        ctk.CTkLabel(form, text="Song title", text_color=MUTED).grid(row=0, column=1, sticky="w", padx=(12, 0))
+        self.artist = ctk.CTkEntry(form, height=38, placeholder_text="Artist")
+        self.title_e = ctk.CTkEntry(form, height=38, placeholder_text="Song title")
+        self.artist.grid(row=1, column=0, sticky="ew")
+        self.title_e.grid(row=1, column=1, sticky="ew", padx=(12, 0))
+
+        folder = ctk.CTkFrame(f, fg_color="transparent")
+        folder.pack(fill="x", pady=(14, 0))
+        ctk.CTkLabel(folder, text="Save to", text_color=MUTED).pack(side="left")
+        self.folder_lbl = ctk.CTkLabel(folder, text=str(self.songs_dir), anchor="w")
+        self.folder_lbl.pack(side="left", padx=10, fill="x", expand=True)
+        ctk.CTkButton(folder, text="Change", width=80, fg_color=CARD, hover_color=CARD_HOVER,
+                      text_color=("#222", "#eee"), command=self.pick_folder).pack(side="right")
+
+        self.go = ctk.CTkButton(f, text="Make my song", height=48, corner_radius=12,
+                                font=ctk.CTkFont(size=17, weight="bold"), fg_color=ACCENT,
+                                hover_color=ACCENT_HOVER, state="disabled", command=self.start)
+        self.go.pack(fill="x", pady=(22, 0))
+        self.hint = ctk.CTkLabel(f, text="Takes a few minutes. A graphics card makes it much faster.",
+                                 text_color=MUTED)
+        self.hint.pack(pady=(10, 0))
+        self.switch(f)
+        if self.src:
+            self.set_source(self.src)
+
+    def browse(self):
+        from tkinter import filedialog
+        p = filedialog.askopenfilename(title="Choose a song",
+                                       filetypes=[("Audio", "*.mp3 *.wav *.flac *.ogg *.m4a *.opus"),
+                                                  ("All files", "*.*")])
+        if p:
+            self.set_source(Path(p))
+
+    def on_drop(self, event):
+        files = [Path(p) for p in self.tk.splitlist(event.data)]
+        files = [p for p in files if p.suffix.lower() in AUDIO_EXT]
+        if files:
+            self.set_source(files[0])
+
+    def set_source(self, path: Path):
+        if getattr(self, "working", False) or not hasattr(self, "artist") or not self.artist.winfo_exists():
+            return
+        self.src = path
+        artist, title = pipeline.parse_name(path)
+        for entry, val in ((self.artist, artist), (self.title_e, title)):
+            entry.delete(0, "end")
+            entry.insert(0, val)
+        self.drop_title.configure(text=path.name)
+        self.drop_sub.configure(text="Ready. Check the names below, then press Make my song.")
+        self.drop.configure(border_color=GOOD)
+        self.go.configure(state="normal")
+
+    def pick_folder(self):
+        from tkinter import filedialog
+        d = filedialog.askdirectory(title="Where should songs be saved?",
+                                    initialdir=str(self.songs_dir) if self.songs_dir.exists() else None)
+        if d:
+            self.songs_dir = Path(d)
+            self.folder_lbl.configure(text=d)
+            self.cfg["songs_dir"] = d
+            save_config(self.cfg)
+
+    # ---------- progress ----------
+    def start(self):
+        if not self.src:
+            return
+        self.cfg["songs_dir"] = str(self.songs_dir)
+        save_config(self.cfg)
+        artist, title = self.artist.get().strip(), self.title_e.get().strip() or self.src.stem
+        self.working = True
+        self.stop.clear()
+
+        f = ctk.CTkFrame(self, fg_color="transparent")
+        self.header(f, "Making your song", f"{artist + ' - ' if artist else ''}{title}")
+        card = ctk.CTkFrame(f, fg_color=CARD, corner_radius=18)
+        card.pack(fill="x")
+        self.step_lbls = []
+        for s in pipeline.STEPS:
+            lbl = ctk.CTkLabel(card, text=f"○  {s}", anchor="w", font=ctk.CTkFont(size=16),
+                               text_color=MUTED)
+            lbl.pack(fill="x", padx=24, pady=(14 if not self.step_lbls else 6, 0))
+            self.step_lbls.append(lbl)
+        ctk.CTkLabel(card, text="").pack(pady=4)
+        self.bar = ctk.CTkProgressBar(f, height=14, progress_color=ACCENT)
+        self.bar.set(0)
+        self.bar.pack(fill="x", pady=(22, 6))
+        self.pct = ctk.CTkLabel(f, text="Starting...", text_color=MUTED)
+        self.pct.pack()
+        ctk.CTkButton(f, text="Cancel", width=110, fg_color=CARD, hover_color=CARD_HOVER,
+                      text_color=("#222", "#eee"), command=self.cancel).pack(pady=18)
+        self.switch(f)
+
+        threading.Thread(target=self.work, args=(self.src, artist, title), daemon=True).start()
+
+    def cancel(self):
+        self.stop.set()
+        self.pct.configure(text="Cancelling...")
+
+    def ui(self, fn, *a):
+        """Run fn(*a) on the main thread (safe to call from the worker thread)."""
+        self.q.put((fn, a))
+
+    def drain(self):
+        try:
+            while True:
+                fn, a = self.q.get_nowait()
+                fn(*a)
+        except queue.Empty:
+            pass
+        self.after(50, self.drain)
+
+    def set_step(self, i):
+        for n, lbl in enumerate(self.step_lbls):
+            name = pipeline.STEPS[n]
+            if n < i:
+                lbl.configure(text=f"✓  {name}", text_color=GOOD)
+            elif n == i:
+                lbl.configure(text=f"●  {name}...", text_color=("#111", "#fff"))
+            else:
+                lbl.configure(text=f"○  {name}", text_color=MUTED)
+
+    def set_progress(self, frac):
+        self.bar.set(frac)
+        self.pct.configure(text=f"{int(frac * 100)}%")
+
+    def work(self, src, artist, title):
+        try:
+            res = pipeline.make_song(
+                src, artist, title, self.songs_dir, charter=self.cfg.get("charter", ""),
+                on_step=lambda i: self.ui(self.set_step, i),
+                on_progress=lambda fr: self.ui(self.set_progress, fr), stop=self.stop)
+            self.ui(self.show_result, res)
+        except pipeline.Cancelled:
+            self.ui(self.finish_busy)
+            self.ui(self.show_home)
+        except Exception as e:
+            traceback.print_exc()
+            self.ui(self.finish_busy)
+            self.ui(self.show_error, str(e))
+
+    def finish_busy(self):
+        self.working = False
+
+    # ---------- result ----------
+    def show_error(self, msg):
+        f = ctk.CTkFrame(self, fg_color="transparent")
+        self.header(f, "Something went wrong", "Your song could not be made. Details below.")
+        box = ctk.CTkTextbox(f, height=240)
+        box.insert("1.0", msg)
+        box.configure(state="disabled")
+        box.pack(fill="x")
+        ctk.CTkButton(f, text="Try again", height=42, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                      command=self.show_home).pack(pady=18)
+        self.switch(f)
+
+    def show_result(self, res: pipeline.Result):
+        self.working = False
+        self.result = res
+        f = ctk.CTkFrame(self, fg_color="transparent")
+        self.header(f, "Your song is ready ✓", f"Saved to {res.song_dir}")
+
+        ctk.CTkLabel(f, text="Listen to the instruments", font=ctk.CTkFont(size=15, weight="bold")
+                     ).pack(anchor="w", pady=(0, 6))
+        self.play_buttons = {}
+        for label, path in res.stems.items():
+            row = ctk.CTkFrame(f, fg_color=CARD, corner_radius=12)
+            row.pack(fill="x", pady=3)
+            ctk.CTkLabel(row, text=label, font=ctk.CTkFont(size=15)).pack(side="left", padx=16, pady=10)
+            if winsound:
+                b = ctk.CTkButton(row, text="▶  Play", width=96, fg_color=ACCENT,
+                                  hover_color=ACCENT_HOVER,
+                                  command=lambda l=label, p=path: self.toggle_play(l, p))
+                b.pack(side="right", padx=12, pady=8)
+                self.play_buttons[label] = b
+
+        names = {"PART GUITAR": "Guitar", "PART BASS": "Bass", "PART DRUMS": "Drums"}
+        summary = "   ·   ".join(f"{names[k]}: {v} notes" for k, v in res.counts.items())
+        info = ctk.CTkFrame(f, fg_color=CARD, corner_radius=12)
+        info.pack(fill="x", pady=(14, 0))
+        ctk.CTkLabel(info, text=f"Detected tempo ~{res.bpm:g} BPM   ·   {summary}",
+                     wraplength=700, justify="left").pack(anchor="w", padx=16, pady=(12, 2))
+        ctk.CTkLabel(info, text="The chart is an automatic first draft on all four difficulties. "
+                                "To fine-tune it, open notes.mid in Moonscraper.",
+                     text_color=MUTED, wraplength=700, justify="left").pack(anchor="w", padx=16, pady=(0, 12))
+
+        btns = ctk.CTkFrame(f, fg_color="transparent")
+        btns.pack(fill="x", pady=(18, 0))
+        ctk.CTkButton(btns, text="Open song folder", height=44, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                      command=lambda: os.startfile(res.song_dir)).pack(side="left", expand=True, fill="x")
+        ctk.CTkButton(btns, text="Make another song", height=44, fg_color=CARD, hover_color=CARD_HOVER,
+                      text_color=("#222", "#eee"), command=self.another).pack(
+            side="left", expand=True, fill="x", padx=(12, 0))
+        self.switch(f)
+
+    def another(self):
+        self.stop_audio()
+        self.cleanup_preview()
+        self.src = None
+        self.show_home()
+
+    # ---------- audio preview ----------
+    def stop_audio(self):
+        if winsound:
+            winsound.PlaySound(None, winsound.SND_PURGE)
+        for lbl, b in self.play_buttons.items():
+            try:
+                b.configure(text="▶  Play")
+            except Exception:
+                pass
+        self.playing = None
+
+    def toggle_play(self, label, path):
+        was = self.playing
+        self.stop_audio()
+        if was == label:
+            return
+        winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC)
+        self.playing = label
+        self.play_buttons[label].configure(text="■  Stop")
+
+    def cleanup_preview(self):
+        if self.result:
+            shutil.rmtree(self.result.preview_dir, ignore_errors=True)
+            self.result = None
+
+    def on_close(self):
+        self.stop.set()
+        self.stop_audio()
+        self.cleanup_preview()
+        self.destroy()
 
 
 if __name__ == "__main__":
+    if getattr(sys, "frozen", False) is False:
+        os.chdir(Path(__file__).resolve().parent)
     App().mainloop()

@@ -1,42 +1,38 @@
-# clone-hero-converter
+# Clone Hero Converter
 
-Automates the tedious first pass of charting: audio -> stems -> rough Clone Hero MIDI.
+Drop in an MP3 or WAV and get a Clone Hero song folder: the song split into guitar, bass, drums and
+vocals, plus an automatic first-draft chart on all four difficulties.
 
-## Setup
-Demucs needs the CUDA build of torch (a plain `pip install demucs` gives CPU-only):
+## Using it
+1. **First time only:** double-click `setup.bat` (needs Python from python.org; downloads a few GB,
+   including PyTorch with NVIDIA GPU support). Everything installs into a private `.venv` folder,
+   so your other Python programs are not affected.
+2. Double-click `run_app.bat`.
+3. Drop a song on the window (or click it), check the artist and title, press **Make my song**.
+4. When it finishes you can listen to each separated instrument, then open the song folder.
+   Copy that folder into your Clone Hero songs folder (or point **Save to** straight at it).
 
-    python -m pip uninstall torch torchvision torchaudio -y
-    python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
-    python -m pip install demucs mido
+A graphics card makes it much faster (about 11 seconds for 40 seconds of music on an RTX 4070 Ti).
 
-Optional: put `ffmpeg` on PATH so stems are written as .ogg instead of .wav.
+## What comes out
+`<Artist - Title>/` containing `guitar.ogg` (everything that is not drums, bass or vocals), `bass.ogg`,
+`drums.ogg`, `vocals.ogg`, `notes.mid` and `song.ini`.
 
-## GUI
-Double-click `run_app.bat` (or `python app.py`). Needs `python -m pip install mido` plus
-the Demucs setup above, using the same Python. Tab 1 queues files and separates stems into song
-folders (progress bar, live log, cancel). Tab 2 converts a MIDI to `notes.mid`, with a source-track
-picker. Settings are remembered in `~/.clone_hero_converter.json`. The CLI scripts below still work.
+The chart is a rough draft: tempo is detected as a single steady BPM, guitar and bass notes come from
+onset and pitch detection spread over the five frets, and drums are labelled kick, snare, hi-hat and
+crash by frequency band. Expect to tidy it in Moonscraper (use File > Load on `notes.mid`) and fix the
+BPM markers and offset by hand, especially for songs with tempo changes.
 
-## 1. Split stems into song folders
-    python separate.py "D:\inbox" -o "G:\Songs\Clone Hero" --charter you
+## How it works
+`chc/pipeline.py` runs: ffmpeg decode -> Demucs `htdemucs_ft` (`chc/worker.py`, separate process so it
+can be cancelled) -> `chc/analysis.py` (tempo, onsets, pitch, drum bands) -> `chc/chart.py` (MIDI
+writer, difficulty reduction). `app.py` is the interface (customtkinter + tkinterdnd2 for drag-and-drop).
 
-Name inputs `Artist - Title.mp3`. Output per song: `guitar.ogg` (Demucs "other"),
-`bass.ogg`, `drums.ogg`, `vocals.ogg`, and a templated `song.ini`.
+MIDI note numbers used (verified against TheNathannator/GuitarGame_ChartFormats):
+- Guitar/bass Expert 96-100 green..orange (Hard 84, Medium 72, Easy 60 base).
+- Drums Expert 96 kick, 97 red, 98 yellow cymbal, 99 blue, 100 green cymbal (same offsets per difficulty).
+- Tracks are named `PART GUITAR`, `PART BASS`, `PART DRUMS`, plus an `EVENTS` track.
 
-## 2. Convert Ableton/Basic Pitch MIDI to Clone Hero MIDI
-    python midi_to_ch.py guitar.mid "<song folder>\notes.mid" -i guitar
-    python midi_to_ch.py drums.mid  "<song folder>\notes.mid" -i drums
-
-Guitar notes are made monophonic, thinned (`--min-gap`), and spread over 5 lanes
-(`--lane-mode quantile|contour|single`). Drums map General MIDI pitches
-(kick 36, snare 38, hats 42, toms 41-50, cymbals 49/51/57) to pro-drum lanes with tom markers.
-Tempo/time-signature events are copied from the source MIDI.
-One instrument per run; to combine instruments, load each in Moonscraper and copy over.
-
-## MIDI spec used (verified against TheNathannator/GuitarGame_ChartFormats)
-- Track names: `PART GUITAR`, `PART BASS`, `PART DRUMS`; first track is the tempo map, plus `EVENTS`.
-- Guitar/bass Expert: 96 green, 97 red, 98 yellow, 99 blue, 100 orange, 95 open (needs `[ENHANCED_OPENS]`),
-  101 force HOPO, 102 force strum. Hard starts at 84, Medium 72, Easy 60.
-  Star power 116, solo 103, tap 104.
-- Drums Expert: 96 kick, 97 red, 98 yellow, 99 blue, 100 green (4-lane) / orange (5-lane), 101 5-lane green.
-  Tom markers: 110 yellow, 111 blue, 112 green (unmarked = cymbal).
+## Advanced command-line tools
+`advanced/separate.py` (batch Demucs into folders) and `advanced/midi_to_ch.py` (convert a MIDI from
+Ableton into Clone Hero MIDI). They are separate from the app and need `python -m pip install mido`.
