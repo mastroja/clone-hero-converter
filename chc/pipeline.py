@@ -78,8 +78,16 @@ def make_song(src: Path, artist: str, title: str, songs_dir: Path, charter: str 
         check()
 
         on_step(1)
-        _separate(wav, preview_dir, model, lambda f: on_progress(0.05 + 0.65 * f), stop)
+        six = ml.available("guitar") and ml.stem_source("guitar") == "s6"
+        span = 0.5 if six else 0.65
+        _separate(wav, preview_dir, model, lambda f: on_progress(0.05 + span * f), stop)
         check()
+        guitar_wav = preview_dir / "other.wav"
+        if six:
+            # this guitar model learned from htdemucs_6s, which splits guitar from keys/synths
+            _separate(wav, work / "six", "htdemucs_6s", lambda f: on_progress(0.55 + 0.15 * f), stop)
+            guitar_wav = work / "six" / "guitar.wav"
+            check()
 
         on_step(2); on_progress(0.72)
         drums_x, sr = audio.read_wav(preview_dir / "drums.wav")
@@ -96,7 +104,7 @@ def make_song(src: Path, artist: str, title: str, songs_dir: Path, charter: str 
         check()
 
         on_step(3); on_progress(0.80)
-        other_x, _ = audio.read_wav(preview_dir / "other.wav")
+        other_x, _ = audio.read_wav(guitar_wav)
         bass_x, _ = audio.read_wav(preview_dir / "bass.wav")
         if ml.available("drums"):
             drum_timed = ml.drum_notes(drums_x, sr)

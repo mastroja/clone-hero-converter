@@ -1,4 +1,9 @@
-"""python -m train.train <guitar|bass|drums> [--steps N] [--out models/x.pt] [--dm-frac 0.5]"""
+"""python -m train.train <kind> [--steps N] [--out models/x.pt] [--dm-frac 0.6]
+                           [--data v2|v3] [--dm-src ft|s6] [--rel]
+
+kind is the feature/model kind (guitar, guitar_hr, bass, bass_hr, drums, mix). --data v3 reads
+the song-id layout built by separate_v3 + feats_v3; --dm-src picks which Demucs model's stems
+to learn from (s6 = htdemucs_6s's real guitar stem); --rel adds up/same/down fret outputs."""
 import argparse
 import time
 from pathlib import Path
@@ -14,22 +19,29 @@ from . import data
 WIN = 1024  # frames per training window (~12 s); overridden by --win
 
 
+def _in(t, t0, t1):
+    return t0 - 0.1 <= t <= t1 + 0.1
+
+
 class Bank:
     """Memory-mapped features plus lazily built targets for a set of songs."""
 
-    def __init__(self, kind, items, path=data.feat_path):
+    def __init__(self, kind, items, path, n_out=None):
+        """path(i, song, kind) -> feature file."""
         self.kind, self.items = kind, items
-        self.n_ch = len(cnn.CHANNELS[kind])
+        self.n_ch = n_out or len(cnn.CHANNELS[kind])
         self.n_lanes = cnn.n_lanes(kind)
-        self.feats, self.stats, self.evs, self.attrs = {}, {}, {}, {}
+        self.feats, self.stats, self.evs, self.attrs, self.dirs = {}, {}, {}, {}, {}
         for i, s in items:
-            f = np.load(path(i, kind), mmap_mode="r")
+            f = np.load(path(i, s, kind), mmap_mode="r")
             self.feats[i] = f
             sample = np.asarray(f[:: max(1, len(f) // 400)], dtype=np.float32)
             self.stats[i] = (float(sample.mean()), float(sample.std() + 1e-6))
             self.evs[i] = data.events(s, kind)
             if self.n_ch > self.n_lanes:
                 self.attrs[i] = data.attributes(s, kind)
+            if self.n_ch > self.n_lanes + 2:
+                self.dirs[i] = data.directions(s, kind)
         # sample songs in proportion to their length
         self.w = np.array([len(self.feats[i]) for i, _ in items], float)
         self.w /= self.w.sum()
@@ -42,18 +54,21 @@ class Bank:
         m, sd = self.stats[i]
         x = (x - m) / sd
         t0, t1 = a / features.FPS, (a + len(x)) / features.FPS
-        ev = [(t - t0, c) for t, c in self.evs[i] if t0 - 0.1 <= t <= t1 + 0.1]
+        ev = [(t - t0, c) for t, c in self.evs[i] if _in(t, t0, t1)]
         y = np.zeros((len(x), self.n_ch), np.float32)
-        y[:, :self.n_lanes] = data.targets(ev, len(x), self.n_lanes)
+        nl = self.n_lanes
+        y[:, :nl] = data.targets(ev, len(x), nl)
         if i in self.attrs:
             hopo, sus = self.attrs[i]
-            y[:, self.n_lanes] = data.targets([(t - t0, 0) for t in hopo if t0 - 0.1 <= t <= t1 + 0.1],
-                                              len(x), 1)[:, 0]
+            y[:, nl] = data.targets([(t - t0, 0) for t in hopo if _in(t, t0, t1)], len(x), 1)[:, 0]
             for s0, s1 in sus:
                 if s1 >= t0 and s0 <= t1:
                     lo = max(0, int(round((s0 - t0) * features.FPS)) + 2)
                     hi = min(len(x), int(round((s1 - t0) * features.FPS)))
-                    y[lo:hi, self.n_lanes + 1] = 1.0
+                    y[lo:hi, nl + 1] = 1.0
+        if i in self.dirs:
+            d = [(t - t0, c) for t, c in self.dirs[i] if _in(t, t0, t1)]
+            y[:, nl + 2:nl + 5] = data.targets(d, len(x), 3)
         if len(x) < WIN:
             x = np.pad(x, ((0, WIN - len(x)), (0, 0)))
             y = np.pad(y, ((0, WIN - len(y)), (0, 0)))
@@ -61,12 +76,15 @@ class Bank:
 
 
 def attribute_scores(probs, songs, kind):
-    """How well hammer-ons and sustains are called on the true notes: (hopo P/R/F1, sustain P/R/F1)."""
+    """Calls on the true notes: (hammer-on P/R/F1, sustain P/R/F1, direction accuracy or None)."""
     h = [0, 0, 0]
     s = [0, 0, 0]
+    d_ok = d_n = 0
     nl = cnn.n_lanes(kind)
     for p, song in zip(probs, songs):
-        for n in song["notes"][data.base(kind)]:
+        notes = song["notes"][data.base(kind)]
+        dirs = dict(data.directions(song, kind)) if p.shape[1] >= nl + 5 else {}
+        for n in notes:
             if len(n) < 4:
                 continue
             fr = int(round(n[0] * features.FPS))
@@ -81,16 +99,18 @@ def attribute_scores(probs, songs, kind):
                     acc[1] += 1
                 elif true:
                     acc[2] += 1
-    return data.prf(*h), data.prf(*s)
+            if n[0] in dirs:
+                d_n += 1
+                d_ok += int(np.argmax(p[max(0, fr - 2): fr + 3, nl + 2:nl + 5].max(axis=0))) == dirs[n[0]]
+    return data.prf(*h), data.prf(*s), (d_ok / d_n if d_n else None)
 
 
-def evaluate(model, items, kind, device, thresholds=None, grid=(0.2, 0.3, 0.4, 0.5, 0.6),
-             path=data.feat_path):
+def evaluate(model, items, kind, device, path, thresholds=None, grid=(0.2, 0.3, 0.4, 0.5, 0.6)):
     """Return (best lane-aware (P,R,F1), thr), any-lane (P,R,F1), attribute scores or None."""
     n_l = cnn.n_lanes(kind)
     probs, truths = [], []
     for i, s in items:
-        probs.append(cnn.predict(model, np.load(path(i, kind)), device))
+        probs.append(cnn.predict(model, np.load(path(i, s, kind)), device))
         truths.append(data.events(s, kind))
     best = None
     for thr in (grid if thresholds is None else [thresholds]):
@@ -114,6 +134,17 @@ def evaluate(model, items, kind, device, thresholds=None, grid=(0.2, 0.3, 0.4, 0
     return best, data.prf(tp, fp, fn), attrs
 
 
+def split_items(layout, kind, index):
+    """(clean train, Demucs train, Demucs val, clean val) as [(i, song)] with features on disk."""
+    inst = data.base(kind)
+    have = [(i, s) for i, s in enumerate(index) if inst in s["notes"]]
+    clean = [(i, s) for i, s in have if layout.clean(i, s, kind).exists()]
+    dm = [(i, s) for i, s in have if layout.dm(i, s, kind).exists()]
+    tr = lambda xs: [x for x in xs if data.split_of(x[1]) == "train"]
+    va = lambda xs: [x for x in xs if data.split_of(x[1]) == "val"]
+    return tr(clean), tr(dm), va(dm), va(clean)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("kind", choices=list(cnn.CHANNELS))
@@ -125,51 +156,60 @@ def main():
     ap.add_argument("--win", type=int, default=1024)
     ap.add_argument("--dm-frac", type=float, default=0.5,
                     help="share of training windows taken from Demucs-separated stems")
+    ap.add_argument("--data", choices=["v2", "v3"], default="v2")
+    ap.add_argument("--dm-src", choices=["ft", "s6"], default="ft")
+    ap.add_argument("--rel", action="store_true", help="also learn up/same/down fret moves")
     args = ap.parse_args()
     global WIN
     WIN = args.win
     out = Path(args.out or f"models/{args.kind}.pt")
-    out.parent.mkdir(exist_ok=True)
+    out.parent.mkdir(parents=True, exist_ok=True)
     device = "cuda"
-    index = data.load_index()
-    train_items = data.songs_for(args.kind, "train", index)
-    # songs with only a full mix have Demucs stems but no original stem: they train the Demucs bank
-    dm_all = [(i, s) for i, s in enumerate(index) if data.base(args.kind) in s["notes"]
-              and data.dm_path(i, args.kind).exists()]
-    dm_items = [(i, s) for i, s in dm_all if data.split_of(s) == "train"]
+    layout = data.Layout(args.data, args.dm_src)
+    index = layout.index()
+    train_items, dm_items, val_dm, val_clean = split_items(layout, args.kind, index)
     if args.max_songs:
         train_items, dm_items = train_items[:args.max_songs], dm_items[:args.max_songs]
-    val_dm = [(i, s) for i, s in dm_all if data.split_of(s) == "val"]
     # score on Demucs stems when we have them: that is what the app feeds the model
-    val_items, val_path = (val_dm, data.dm_path) if val_dm else (data.songs_for(args.kind, "val", index), data.feat_path)
-    print(f"{args.kind}: {len(train_items)} train ({len(dm_items)} with Demucs stems) / "
-          f"{len(val_items)} val songs ({'Demucs' if val_dm else 'original'} stems)", flush=True)
-    banks = [Bank(args.kind, train_items)]
-    frac = 0.0
+    val_items, val_path = (val_dm, layout.dm) if val_dm else (val_clean, layout.clean)
+    print(f"{args.kind} ({args.data}, Demucs {args.dm_src}): {len(train_items)} original-stem + "
+          f"{len(dm_items)} Demucs-stem train songs / {len(val_items)} val songs "
+          f"({'Demucs' if val_dm else 'original'} stems)", flush=True)
+    n_out = len(cnn.CHANNELS[args.kind])
+    if args.rel:
+        if cnn.n_lanes(args.kind) == n_out:
+            raise SystemExit("--rel is for guitar/bass")
+        n_out += len(cnn.REL)
+    banks, weights = [], []
+    if train_items:
+        banks.append(Bank(args.kind, train_items, layout.clean, n_out))
+        weights.append(1 - args.dm_frac if dm_items else 1.0)
     if dm_items and args.dm_frac > 0:
-        banks.append(Bank(args.kind, dm_items, data.dm_path))
-        frac = args.dm_frac
+        banks.append(Bank(args.kind, dm_items, layout.dm, n_out))
+        weights.append(args.dm_frac if train_items else 1.0)
+    weights = np.array(weights) / sum(weights)
     rng = np.random.default_rng(0)
-    model = cnn.NoteNet(args.kind, args.hidden).to(device)
-    n_l, n_out = cnn.n_lanes(args.kind), model.n_out
+    model = cnn.NoteNet(args.kind, args.hidden, n_out).to(device)
+    n_l = cnn.n_lanes(args.kind)
     print("params", sum(p.numel() for p in model.parameters()), flush=True)
     opt = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-2)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=2e-3, total_steps=args.steps, pct_start=0.1)
     pw = torch.full((n_out,), 6.0, device=device)
     if n_out > n_l:
         pw[n_l], pw[n_l + 1] = 3.0, 1.0  # hammer-on flags are sparse; sustain spans are not
+    if n_out > n_l + 2:
+        pw[n_l + 2:] = 3.0
     lossf = tnn.BCEWithLogitsLoss(pos_weight=pw)
     t0 = time.time()
     run, best_f = 0.0, -1.0
 
     def save(thr):
         torch.save({"state": model.state_dict(), "kind": args.kind, "thr": thr, "hidden": args.hidden,
-                    "n_out": n_out}, out)
+                    "n_out": n_out, "data": args.data, "dm_src": args.dm_src, "rel": args.rel}, out)
 
     for step in range(1, args.steps + 1):
         model.train()
-        xs, ys = zip(*(banks[int(len(banks) > 1 and rng.random() < frac)].window(rng)
-                       for _ in range(args.batch)))
+        xs, ys = zip(*(banks[rng.choice(len(banks), p=weights)].window(rng) for _ in range(args.batch)))
         x = torch.from_numpy(np.stack(xs)).to(device)
         y = torch.from_numpy(np.stack(ys)).to(device)
         x = x + 0.05 * torch.randn_like(x)  # light noise augmentation
@@ -183,11 +223,13 @@ def main():
         run = 0.98 * run + 0.02 * loss.item() if step > 1 else loss.item()
         if step % 100 == 0:
             print(f"step {step} loss {run:.4f} {time.time() - t0:.0f}s", flush=True)
-        if step % 1500 == 0 or step == args.steps:
-            ((p, r, f), thr), anyl, attrs = evaluate(model, val_items, args.kind, device, path=val_path)
+        if step % 2500 == 0 or step == args.steps:
+            ((p, r, f), thr), anyl, attrs = evaluate(model, val_items, args.kind, device, val_path)
             msg = f"  VAL thr {thr}: P {p:.3f} R {r:.3f} F1 {f:.3f} | any-lane F1 {anyl[2]:.3f}"
             if attrs:
                 msg += f" | hopo F1 {attrs[0][2]:.3f} sustain F1 {attrs[1][2]:.3f}"
+                if attrs[2] is not None:
+                    msg += f" | direction acc {attrs[2]:.3f}"
             print(msg, flush=True)
             if f > best_f:  # keep the best checkpoint, not just the last
                 best_f = f

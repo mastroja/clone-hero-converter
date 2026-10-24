@@ -15,13 +15,23 @@ CHANNELS = {
     "drums": ["K", "S", "Ycym", "Ytom", "Bcym", "Btom", "Gcym", "Gtom"],
 }
 CHANNELS["mix"] = ["beat", "down"]
-CHANNELS["guitar2"] = CHANNELS["guitar"]
-CHANNELS["bass2"] = CHANNELS["bass"]
+for _k in ("guitar2", "guitar_hr"):
+    CHANNELS[_k] = CHANNELS["guitar"]
+for _k in ("bass2", "bass_hr"):
+    CHANNELS[_k] = CHANNELS["bass"]
+# optional extra outputs (train --rel): is this note's lowest fret above, equal to or below
+# the previous note's? Charters place frets by the melody's shape, not absolute pitch.
+REL = ["up", "same", "down"]
+
+
+def instrument(kind: str) -> str:
+    """Feature/model kind -> instrument ('guitar_hr' -> 'guitar', 'bass2' -> 'bass')."""
+    return kind.split("_")[0].rstrip("2")
 
 
 def n_lanes(kind: str) -> int:
     """Number of note-onset channels (the rest are per-note attributes)."""
-    return 5 if kind.rstrip("2") in ("guitar", "bass") else len(CHANNELS[kind])
+    return 5 if instrument(kind) in ("guitar", "bass") else len(CHANNELS[kind])
 
 
 class NoteNet(nn.Module):
@@ -29,7 +39,7 @@ class NoteNet(nn.Module):
         super().__init__()
         self.kind = kind
         self.n_out = n_out or len(CHANNELS[kind])
-        n_bins = features.KINDS[kind][1]
+        n_bins = features.n_bins(kind)
         ch = [1, 16, 32, 48]
         pools = [3, 3, 2]
         layers, f = [], n_bins

@@ -9,6 +9,7 @@ from . import features, nn
 MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
 _cache: dict = {}
 _settings: dict = {}  # per-kind decoding thresholds saved in the model file
+_meta: dict = {}  # per-kind feature kind and expected stem source
 
 
 def available(kind: str) -> bool:
@@ -16,16 +17,29 @@ def available(kind: str) -> bool:
 
 
 def load(kind: str, device="cuda"):
+    """kind is the instrument ('guitar'); the model file says which features it was trained on."""
     if kind not in _cache:
         ck = torch.load(MODEL_DIR / f"{kind}.pt", map_location=device, weights_only=False)
+        fkind = ck.get("kind", kind)
+        if fkind not in features.KINDS or nn.instrument(fkind) != nn.instrument(kind):
+            fkind = kind
         n_out = ck.get("n_out") or ck["state"]["out.weight"].shape[0]  # older models have 5 outputs
-        m = nn.NoteNet(kind, ck.get("hidden", 128), n_out).to(device)
+        m = nn.NoteNet(fkind, ck.get("hidden", 128), n_out).to(device)
         m.load_state_dict(ck["state"])
         m.eval()
         _cache[kind] = (m, ck.get("thr", 0.4))
+        _meta[kind] = {"features": fkind, "stems": ck.get("dm_src", "ft")}
         if ck.get("decode"):
             _settings[kind] = ck["decode"]
     return _cache[kind]
+
+
+def stem_source(kind: str) -> str:
+    """Which Demucs model's stem this model expects: 'ft' (htdemucs_ft) or 's6' (htdemucs_6s)."""
+    if not available(kind):
+        return "ft"
+    load(kind, "cuda" if torch.cuda.is_available() else "cpu")
+    return _meta[kind]["stems"]
 
 
 def to_model_rate(wave: np.ndarray, sr: int, device="cuda") -> np.ndarray:
@@ -39,7 +53,7 @@ def to_model_rate(wave: np.ndarray, sr: int, device="cuda") -> np.ndarray:
 def probabilities(kind: str, wave: np.ndarray, sr: int, device=None) -> np.ndarray:
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model, _ = load(kind, device)
-    feats = features.compute(to_model_rate(wave, sr, device), kind, device)
+    feats = features.compute(to_model_rate(wave, sr, device), _meta[kind]["features"], device)
     return nn.predict(model, feats, device)
 
 
@@ -57,7 +71,52 @@ MIN_SUSTAIN = 0.30  # seconds; shorter held notes are charted as plain notes
 
 def decode_settings(kind: str) -> dict:
     """Decoding thresholds tuned on validation songs (train.calibrate), else defaults."""
-    return {"thr": 0.35, "ratios": CHORD_RATIO[kind], "hopo": 0.5, "sus": 0.5, **_settings.get(kind, {})}
+    return {"thr": 0.35, "ratios": CHORD_RATIO[kind], "hopo": 0.5, "sus": 0.5, "rel": 1.0,
+            **_settings.get(kind, {})}
+
+
+def follow_directions(lanes, segs, rel_p, weight):
+    """Re-place each note's frets so the chart follows the predicted melody shape.
+
+    lanes: each note's lane tuple from the per-note pick; segs: each note's five lane
+    probabilities; rel_p: each note's (up, same, down) probabilities against the previous note.
+    A Viterbi pass picks every note's lowest fret (keeping its chord shape) to balance how
+    likely those frets are against agreeing with the up/same/down calls, weighted by `weight`.
+    """
+    K = len(lanes)
+    if K < 2 or weight <= 0:
+        return lanes
+    NEG = -1e9
+    lowest = [min(l) for l in lanes]
+    span = [max(l) - lo for l, lo in zip(lanes, lowest)]
+
+    def unary(k, a):
+        if a + span[k] > 4:
+            return NEG
+        shape = [l - lowest[k] + a for l in lanes[k]]
+        return float(np.log(segs[k][shape] + 1e-4).mean())
+
+    score = np.array([[unary(0, a) for a in range(5)]])
+    back = []
+    for k in range(1, K):
+        r = np.log(rel_p[k] / max(rel_p[k].sum(), 1e-6) + 1e-4)
+        row, ptr = np.full(5, NEG), np.zeros(5, int)
+        for a in range(5):
+            u = unary(k, a)
+            if u == NEG:
+                continue
+            trans = score[-1] + weight * np.array([r[0 if a > b else 1 if a == b else 2] for b in range(5)])
+            j = int(np.argmax(trans))
+            row[a], ptr[a] = u + trans[j], j
+        score = np.vstack([score[-1:], row])
+        back.append(ptr)
+    a = int(np.argmax(score[-1]))
+    anchors = [a]
+    for ptr in reversed(back):
+        a = int(ptr[a])
+        anchors.append(a)
+    anchors.reverse()
+    return [tuple(sorted(l - lo + a for l in ln)) for ln, lo, a in zip(lanes, lowest, anchors)]
 
 
 def fretted_notes(kind: str, wave: np.ndarray, sr: int):
@@ -66,23 +125,28 @@ def fretted_notes(kind: str, wave: np.ndarray, sr: int):
     return decode_fretted(kind, probabilities(kind, wave, sr), **decode_settings(kind))
 
 
-def decode_fretted(kind: str, prob: np.ndarray, thr=0.35, ratios=None, hopo=0.5, sus=0.5):
+def decode_fretted(kind: str, prob: np.ndarray, thr=0.35, ratios=None, hopo=0.5, sus=0.5, rel=1.0):
     """Model probabilities -> notes.
 
     Note times are peaks of the strongest lane probability. A second (third) lane joins
     the note only when the model is nearly as sure of it as of the strongest lane, and
     chords never exceed MAX_CHORD lanes. Models trained with the hammer-on/sustain outputs
     also give each note a sustain length and a hammer-on flag; older models give 0 / None.
+    Models with up/same/down outputs then re-place frets along the melody (follow_directions).
     """
     ratios = ratios or CHORD_RATIO[kind]
     hopo_thr, sus_thr = hopo, sus
     lanes_p = prob[:, :5]
     has_attr = prob.shape[1] >= 7
+    has_rel = prob.shape[1] >= 10
     onset = lanes_p.max(axis=1, keepdims=True)
     frames = [fr for fr, _, _ in nn.pick(onset, thr)]
-    out = []
+    out, segs, rels = [], [], []
     for k, fr in enumerate(frames):
         seg = lanes_p[max(0, fr - 2): fr + 3].max(axis=0)
+        segs.append(seg)
+        if has_rel:
+            rels.append(prob[max(0, fr - 2): fr + 3, 7:10].max(axis=0))
         order = np.argsort(-seg)
         lanes = [int(order[0])]
         for j in range(1, MAX_CHORD[kind]):
@@ -100,6 +164,9 @@ def decode_fretted(kind: str, prob: np.ndarray, thr=0.35, ratios=None, hopo=0.5,
             if length < MIN_SUSTAIN:
                 length = 0.0
         out.append((fr / features.FPS, tuple(sorted(lanes)), round(length, 3), hopo))
+    if has_rel and rel > 0 and out:
+        placed = follow_directions([n[1] for n in out], segs, rels, rel)
+        out = [(n[0], lanes, n[2], n[3]) for n, lanes in zip(out, placed)]
     return out
 
 
@@ -110,7 +177,11 @@ def drum_notes(wave: np.ndarray, sr: int, thr=None):
     (cymbal or tom, whichever is likelier), one kick and the two likeliest hand hits, since a
     drummer has two hands.
     """
-    prob = probabilities("drums", wave, sr)
+    return decode_drums(probabilities("drums", wave, sr), thr)
+
+
+def decode_drums(prob: np.ndarray, thr=None):
+    """Drum model probabilities -> [(time_s, lane, is_tom)] (see drum_notes)."""
     raw = []
     for fr, c, p in hits("drums", prob, thr):
         lane = 0 if c == 0 else 1 if c == 1 else 2 + (c - 2) // 2

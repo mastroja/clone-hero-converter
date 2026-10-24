@@ -77,12 +77,26 @@ def parse_mid(path: Path) -> dict:
             if any(n == 101 for _, n, _ in notes):
                 out["five_lane"] = True
             hits = {}
-            for tick, n, _ in notes:
-                lane = {95: 0, 96: 0, 97: 1, 98: 2, 99: 3, 100: 4}.get(n)
-                if lane is None:
-                    continue
-                tom = lane in (2, 3, 4) and any(a <= tick < b for a, b in toms[110 + lane - 2])
-                hits[(tick, lane)] = tom
+            if out["five_lane"]:
+                # five-lane kit -> four-lane pro drums, the way Clone Hero converts it:
+                # yellow cymbal, blue tom, orange -> green cymbal, green -> green tom
+                five = {95: (0, False), 96: (0, False), 97: (1, False), 98: (2, False),
+                        99: (3, True), 100: (4, False), 101: (4, True)}
+                for tick, n, _ in sorted(notes, key=lambda x: (x[0], x[1])):
+                    if n not in five:
+                        continue
+                    lane, tom = five[n]
+                    if (tick, lane) in hits and n == 101:  # orange + green together
+                        lane = 3
+                    if (tick, lane) not in hits:
+                        hits[(tick, lane)] = tom
+            else:
+                for tick, n, _ in notes:
+                    lane = {95: 0, 96: 0, 97: 1, 98: 2, 99: 3, 100: 4}.get(n)
+                    if lane is None:
+                        continue
+                    tom = lane in (2, 3, 4) and any(a <= tick < b for a, b in toms[110 + lane - 2])
+                    hits[(tick, lane)] = tom
             out["drums"] = sorted((tm.sec(t), lane, tom) for (t, lane), tom in hits.items())
         else:
             groups, ends = {}, {}
@@ -167,8 +181,11 @@ def mix_stems(folder: Path) -> list[Path]:
                   if p.suffix.lower() in STEM_EXT and not p.stem.lower().startswith(SKIP_PREFIX))
 
 
-def index_library(root: Path) -> list[dict]:
-    """One record per usable song folder with chart notes and the stems to learn from."""
+def index_library(root: Path, convert_five: bool = False) -> list[dict]:
+    """One record per usable song folder with chart notes and the stems to learn from.
+
+    convert_five keeps five-lane drum charts (converted to four-lane) instead of dropping them.
+    """
     songs, extra = [], []
     for mid_path in sorted(root.rglob("notes.mid")):
         folder = mid_path.parent
@@ -207,7 +224,7 @@ def index_library(root: Path) -> list[dict]:
             rec["notes"]["bass"] = [(t + delay, list(l), ln, int(h)) for t, l, ln, h in chart["bass"]]
             if b:
                 rec["stems"]["bass"] = [str(b)]
-        if chart["drums"] and not rec["five_lane"]:
+        if chart["drums"] and (convert_five or not rec["five_lane"]):
             rec["notes"]["drums"] = [(t + delay, lane, int(tom)) for t, lane, tom in chart["drums"]]
             if d:
                 rec["stems"]["drums"] = [str(x) for x in d]

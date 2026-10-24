@@ -1,6 +1,7 @@
 """python -m train.calibrate <guitar|bass> <model.pt> : tune how the app turns probabilities into
-notes (onset threshold, how sure extra chord lanes must be, hammer-on and sustain thresholds) on
-validation songs separated by Demucs, and save the settings into the model file."""
+notes (onset threshold, how sure extra chord lanes must be, hammer-on and sustain thresholds,
+how strongly up/same/down calls re-place frets) on validation songs separated by Demucs, and
+save the settings into the model file."""
 import itertools
 import sys
 from collections import Counter
@@ -20,22 +21,24 @@ def chord_mix(notes):
 
 
 def main():
-    kind, path = sys.argv[1], sys.argv[2]
+    inst, path = sys.argv[1], sys.argv[2]
     ck = torch.load(path, map_location="cuda", weights_only=False)
+    kind = ck.get("kind", inst)  # feature kind the model was trained on
     model = cnn.NoteNet(kind, ck.get("hidden", 128), ck["state"]["out.weight"].shape[0]).cuda()
     model.load_state_dict(ck["state"])
-    index = data.load_index()
-    rows = [(i, s) for i, s in enumerate(index) if kind in s["notes"] and data.split_of(s) == "val"
-            and data.dm_path(i, kind).exists()]
-    probs = [cnn.predict(model, np.load(data.dm_path(i, kind)), "cuda") for i, _ in rows]
-    truths = [data.events(s, kind) for _, s in rows]
-    gt_notes = [n for _, s in rows for n in s["notes"][kind]]
+    layout = data.Layout(ck.get("data", "v2"), ck.get("dm_src", "ft"))
+    index = layout.index()
+    rows = [(i, s) for i, s in enumerate(index) if inst in s["notes"] and data.split_of(s) == "val"
+            and layout.dm(i, s, kind).exists()]
+    probs = [cnn.predict(model, np.load(layout.dm(i, s, kind)), "cuda") for i, s in rows]
+    truths = [data.events(s, inst) for _, s in rows]
+    gt_notes = [n for _, s in rows for n in s["notes"][inst]]
     print(f"{len(rows)} val songs; real charts: {chord_mix(gt_notes)}")
 
-    def chart_score(thr, ratios):
+    def chart_score(thr, ratios, rel=0.0):
         res, notes = [], []
         for p, tr in zip(probs, truths):
-            got = ml.decode_fretted(kind, p, thr, ratios)
+            got = ml.decode_fretted(inst, p, thr, ratios, rel=rel)
             notes += got
             res.append(metrics.score([(t, l) for t, lanes, *_ in got for l in lanes], tr))
         return metrics.summarize(res), notes
@@ -47,9 +50,9 @@ def main():
     # chart without chords feels wrong too: require at least half the real charts' share of
     # chords, and of triple chords.
     need = 0.5 * chord_share(gt_notes)
-    need3 = 0.5 * chord_share(gt_notes, 3) if ml.MAX_CHORD[kind] >= 3 else 0.0
+    need3 = 0.5 * chord_share(gt_notes, 3) if ml.MAX_CHORD[inst] >= 3 else 0.0
     best = fallback = None
-    hi = ml.MAX_CHORD[kind] > 2
+    hi = ml.MAX_CHORD[inst] > 2
     for thr, r1, r2 in itertools.product((0.25, 0.3, 0.35, 0.4, 0.45), (0.7, 0.8, 0.85, 0.9, 0.95, 1.01),
                                          (0.9, 0.95, 1.01) if hi else (1.01,)):
         if r2 < r1:
@@ -67,16 +70,24 @@ def main():
     s, thr, ratios, notes = best
     print(f"best onset thr {thr} chord ratios {ratios}: onset F1 {s['onset_F1']:.3f} "
           f"exact-frets F1 {s['exact_F1']:.3f} fret accuracy {s['lane_acc']:.3f}; chords {chord_mix(notes)}")
-    decode = {"thr": thr, "ratios": list(ratios), "hopo": 0.5, "sus": 0.5}
-    if model.n_out >= 7:
+    decode = {"thr": thr, "ratios": list(ratios), "hopo": 0.5, "sus": 0.5, "rel": 0.0}
+    nl = cnn.n_lanes(kind)
+    if model.n_out >= nl + 5:
+        # how much the up/same/down calls may move frets (0 = ignore them)
+        tries = [(chart_score(thr, ratios, w)[0], w) for w in (0.0, 0.5, 1.0, 2.0, 4.0)]
+        for sc, w in tries:
+            print(f"  direction weight {w}: exact-frets F1 {sc['exact_F1']:.3f} fret accuracy {sc['lane_acc']:.3f}")
+        sc, w = max(tries, key=lambda x: x[0]["exact_F1"])
+        decode["rel"] = w
+        print(f"direction weight {w}: exact-frets F1 {sc['exact_F1']:.3f} fret accuracy {sc['lane_acc']:.3f}")
+    if model.n_out >= nl + 2:
         # hammer-on / sustain thresholds judged on the real notes' positions
-        nl = cnn.n_lanes(kind)
         for ch, key, true_of in ((nl, "hopo", lambda n: bool(n[3])), (nl + 1, "sus", lambda n: n[2] > 0)):
             scores = []
             for th in (0.3, 0.4, 0.5, 0.6, 0.7):
                 tp = fp = fn = 0
                 for p, (_, song) in zip(probs, rows):
-                    for n in song["notes"][kind]:
+                    for n in song["notes"][inst]:
                         fr = int(round(n[0] * features.FPS))
                         if fr + 9 > len(p):
                             continue

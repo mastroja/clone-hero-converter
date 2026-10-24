@@ -20,7 +20,42 @@ def split_of(song: dict) -> str:
 
 
 def base(kind: str) -> str:
-    return kind.rstrip("2")
+    return nn.instrument(kind)
+
+
+def song_id(song: dict) -> str:
+    """Stable name for a song's cached files (positions in the index change as songs are added)."""
+    return f"{zlib.crc32(song['folder'].encode('utf-8')):08x}"
+
+
+V3 = Path("data/v3")
+
+
+class Layout:
+    """Where a song's cached features live.
+
+    v2: original-stem features in data/feats and htdemucs_ft features in data/feats_dm, named
+        by position in data/index.json (tonight's run and earlier).
+    v3: everything under data/v3, named by song id: stems/<id>/<stem>.flac from Demucs, and
+        feats/<id>_<source>_<kind>.npy with source 'clean' (the song's own stem), 'ft'
+        (htdemucs_ft) or 's6' (htdemucs_6s, which has a real guitar stem).
+    """
+
+    def __init__(self, version="v2", dm_src="ft"):
+        self.version, self.dm_src = version, dm_src
+
+    def index(self):
+        return load_index(V3 / "index.json" if self.version == "v3" else "data/index.json")
+
+    def clean(self, i, song, kind) -> Path:
+        if self.version == "v2":
+            return feat_path(i, kind)
+        return V3 / "feats" / f"{song_id(song)}_clean_{kind}.npy"
+
+    def dm(self, i, song, kind) -> Path:
+        if self.version == "v2":
+            return dm_path(i, kind)
+        return V3 / "feats" / f"{song_id(song)}_{self.dm_src}_{kind}.npy"
 
 
 def events(song: dict, kind: str):
@@ -65,6 +100,17 @@ def targets(evs, n_frames: int, n_ch: int, sigma=0.8) -> np.ndarray:
             if 0 <= i < n_frames:
                 y[i, c] = max(y[i, c], float(np.exp(-0.5 * ((i - f) / sigma) ** 2)))
     return y
+
+
+def directions(song: dict, kind: str):
+    """Guitar/bass -> [(time, 0 up / 1 same / 2 down)]: each note's lowest fret against the
+    previous note's lowest fret."""
+    notes = song["notes"][base(kind)]
+    out = []
+    for prev, n in zip(notes, notes[1:]):
+        a, b = min(prev[1]), min(n[1])
+        out.append((n[0], 0 if b > a else 1 if b == a else 2))
+    return out
 
 
 def feat_path(i: int, kind: str) -> Path:

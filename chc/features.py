@@ -18,20 +18,35 @@ KINDS = {
     # sharper-in-time variants (shorter analysis window) for A/B tests
     "guitar2": (2048, 160, 60.0, 9000.0),
     "bass2": (2048, 128, 28.0, 2500.0),
+    # pitch-sharp variants: a short window for timing stacked on a long window with three
+    # bins per semitone, so neighbouring notes (one fret apart) land in different bins
+    "guitar_hr": [(2048, 96, 60.0, 9000.0), (8192, 216, 70.0, 4200.0)],
+    "bass_hr": [(2048, 64, 28.0, 2500.0), (8192, 192, 35.0, 1400.0)],
 }
 _banks: dict = {}
 
 
-def _bank(kind: str, device) -> torch.Tensor:
-    key = (kind, str(device))
+def parts(kind: str) -> list:
+    """The (n_fft, n_bins, f_min, f_max) spectrogram banks a feature kind stacks."""
+    k = KINDS[kind]
+    return k if isinstance(k, list) else [k]
+
+
+def n_bins(kind: str) -> int:
+    return sum(p[1] for p in parts(kind))
+
+
+def _bank(part: tuple, device) -> torch.Tensor:
+    key = (part, str(device))
     if key not in _banks:
-        n_fft, n_bins, lo, hi = KINDS[kind]
+        n_fft, n_bins, lo, hi = part
         freqs = np.fft.rfftfreq(n_fft, 1 / SR)
         centers = np.geomspace(lo, hi, n_bins + 2)
         fb = np.zeros((n_bins, len(freqs)), np.float32)
+        # never narrower than ~2 FFT bins (1 for the long pitch window, which is already fine)
+        min_w = (1 if n_fft >= 8192 else 2) * SR / n_fft
         for i in range(n_bins):
             l, c, r = centers[i], centers[i + 1], centers[i + 2]
-            min_w = 2 * SR / n_fft  # never narrower than ~2 FFT bins
             l, r = min(l, c - min_w), max(r, c + min_w)
             up = (freqs - l) / (c - l)
             down = (r - freqs) / (r - c)
@@ -43,12 +58,14 @@ def _bank(kind: str, device) -> torch.Tensor:
 
 def compute(wave: np.ndarray, kind: str, device="cuda") -> np.ndarray:
     """wave: mono float32 at SR. Returns (frames, bins) float16 log-magnitudes."""
-    n_fft = KINDS[kind][0]
     x = torch.from_numpy(wave).to(device)
-    win = torch.hann_window(n_fft, device=device)
-    spec = torch.stft(x, n_fft, HOP, window=win, center=True, return_complex=True).abs()
-    mel = _bank(kind, device) @ spec
-    out = torch.log1p(30.0 * mel).T.contiguous()
+    outs = []
+    for part in parts(kind):
+        n_fft = part[0]
+        win = torch.hann_window(n_fft, device=device)
+        spec = torch.stft(x, n_fft, HOP, window=win, center=True, return_complex=True).abs()
+        outs.append(torch.log1p(30.0 * (_bank(part, device) @ spec)))
+    out = torch.cat(outs, 0).T.contiguous()  # centred frames line up across window sizes
     return out.half().cpu().numpy()
 
 
