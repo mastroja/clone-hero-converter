@@ -133,10 +133,13 @@ def main():
     device = "cuda"
     index = data.load_index()
     train_items = data.songs_for(args.kind, "train", index)
+    # songs with only a full mix have Demucs stems but no original stem: they train the Demucs bank
+    dm_all = [(i, s) for i, s in enumerate(index) if data.base(args.kind) in s["notes"]
+              and data.dm_path(i, args.kind).exists()]
+    dm_items = [(i, s) for i, s in dm_all if data.split_of(s) == "train"]
     if args.max_songs:
-        train_items = train_items[:args.max_songs]
-    dm_items = [(i, s) for i, s in train_items if data.dm_path(i, args.kind).exists()]
-    val_dm = [(i, s) for i, s in data.songs_for(args.kind, "val", index) if data.dm_path(i, args.kind).exists()]
+        train_items, dm_items = train_items[:args.max_songs], dm_items[:args.max_songs]
+    val_dm = [(i, s) for i, s in dm_all if data.split_of(s) == "val"]
     # score on Demucs stems when we have them: that is what the app feeds the model
     val_items, val_path = (val_dm, data.dm_path) if val_dm else (data.songs_for(args.kind, "val", index), data.feat_path)
     print(f"{args.kind}: {len(train_items)} train ({len(dm_items)} with Demucs stems) / "

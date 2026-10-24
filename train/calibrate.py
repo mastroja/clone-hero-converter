@@ -40,25 +40,30 @@ def main():
             res.append(metrics.score([(t, l) for t, lanes, *_ in got for l in lanes], tr))
         return metrics.summarize(res), notes
 
-    def chord_share(notes):
-        return sum(len(n[1]) > 1 for n in notes) / max(1, len(notes))
+    def chord_share(notes, size=2):
+        return sum(len(n[1]) >= size for n in notes) / max(1, len(notes))
 
     # Accuracy alone prefers no chords at all (each guessed extra fret is often wrong), but a
-    # chart without chords feels wrong too: require at least half the real charts' chord share.
+    # chart without chords feels wrong too: require at least half the real charts' share of
+    # chords, and of triple chords.
     need = 0.5 * chord_share(gt_notes)
-    best = None
+    need3 = 0.5 * chord_share(gt_notes, 3) if ml.MAX_CHORD[kind] >= 3 else 0.0
+    best = fallback = None
     hi = ml.MAX_CHORD[kind] > 2
     for thr, r1, r2 in itertools.product((0.25, 0.3, 0.35, 0.4, 0.45), (0.7, 0.8, 0.85, 0.9, 0.95, 1.01),
                                          (0.9, 0.95, 1.01) if hi else (1.01,)):
         if r2 < r1:
             continue
         s, notes = chart_score(thr, (r1, r2))
-        ok = chord_share(notes) >= need
+        ok = chord_share(notes) >= need and chord_share(notes, 3) >= need3
         print(f"  thr {thr} ratios ({r1}, {r2}): exact-frets F1 {s['exact_F1']:.3f} onset F1 "
               f"{s['onset_F1']:.3f} chords {chord_mix(notes)}{'' if ok else '  (too few chords)'}", flush=True)
         # exact_F1: the note is there at the right time AND has exactly the right frets
         if ok and (best is None or s["exact_F1"] > best[0]["exact_F1"]):
             best = (s, thr, (r1, r2), notes)
+        if fallback is None or s["exact_F1"] > fallback[0]["exact_F1"]:
+            fallback = (s, thr, (r1, r2), notes)
+    best = best or fallback  # nothing met the chord rules: take the most accurate
     s, thr, ratios, notes = best
     print(f"best onset thr {thr} chord ratios {ratios}: onset F1 {s['onset_F1']:.3f} "
           f"exact-frets F1 {s['exact_F1']:.3f} fret accuracy {s['lane_acc']:.3f}; chords {chord_mix(notes)}")
