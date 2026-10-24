@@ -90,19 +90,25 @@ def make_song(src: Path, artist: str, title: str, songs_dir: Path, charter: str 
 
         on_step(3); on_progress(0.82)
         other_x, _ = audio.read_wav(preview_dir / "other.wav")
-        pitched = analysis.pitched_notes(other_x, sr, 80, 1000)
-        gtimed = [(t, l) for (t, _), l in zip(pitched, analysis.quantile_lanes([p for _, p in pitched]))]
+        att = analysis.guitar_attacks(other_x, sr)
+        gtimes = [t for t, _ in att]
+        gtimed = list(zip(gtimes, analysis.local_lanes([h for _, h in att], gtimes)))
         check()
         on_progress(0.9)
         bass_x, _ = audio.read_wav(preview_dir / "bass.wav")
         bp = analysis.pitched_notes(bass_x, sr, 35, 300, sensitivity=1.1, min_gap=0.12)
-        btimed = [(t, l) for (t, _), l in zip(bp, analysis.quantile_lanes([p for _, p in bp]))]
+        btimes = [t for t, _ in bp]
+        btimed = list(zip(btimes, analysis.local_lanes([p for _, p in bp], btimes)))
+        # Only snap to the beat grid when the song really sits on one; live or loose
+        # recordings are charted at their exact audio times instead.
+        fit = chart.grid_fit(gtimes + [t for t, _ in drum_timed], bpm, offset)
+        snap = fit < 0.15
         check()
 
         on_step(4); on_progress(0.93)
         song_dir.mkdir(parents=True, exist_ok=True)
         counts = chart.write_mid(song_dir / "notes.mid", bpm, offset,
-                                 guitar=gtimed, bass=btimed, drums=drum_timed)
+                                 guitar=gtimed, bass=btimed, drums=drum_timed, snap=snap)
         chart.write_ini(song_dir / "song.ini", title, artist, charter, int(length * 1000), counts,
                         preview_ms=int(min(30, max(0, length - 40)) * 1000))
         for demucs_name, ch_name in STEM_TO_CH.items():

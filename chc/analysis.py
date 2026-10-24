@@ -169,3 +169,61 @@ def drum_hits(x: np.ndarray, sr: int) -> tuple[list[tuple[float, str]], np.ndarr
                 last = h[0]
     hits.sort()
     return [(t, c) for t, c, _ in hits], full
+
+
+def guitar_attacks(x: np.ndarray, sr: int, max_per_sec: float = 3.2) -> list[tuple[float, float]]:
+    """[(time_s, pitch_height)] for a polyphonic guitar-like stem.
+
+    Attacks come from Basic Pitch's onset posteriors, plus any strong spectral-flux
+    edges it missed (big strums). Pitch height is the weighted mean pitch of what is
+    sounding after the attack, which gives a stable melodic/chord contour. The weakest
+    attacks are dropped so the chart never gets denser than max_per_sec on average
+    within any 4-second window (hand charts leave out ghost notes).
+    """
+    from . import bp
+    note, onset = bp.posteriors(x, sr)
+    att = bp.attacks(note, onset)
+    sal = np.array([s for _, _, s in att]) if att else np.array([1.0])
+    events = [(t, h, float((sal < s).mean())) for t, h, s in att]  # strength = rank 0..1
+    mag = stft_mag(x, N_FFT, HOP)
+    flux = band_flux(mag, sr, 80, 5000)
+    have = np.array([t for t, _, _ in events]) if events else np.array([-9.0])
+    for i in pick_peaks(flux, sr, min_gap=0.08, sensitivity=2.0):
+        t = i * HOP / sr
+        if np.min(np.abs(have - t)) > 0.06:
+            h = bp.height_at(note, t)
+            if h is not None:
+                events.append((t, h, float((flux < flux[i]).mean())))
+    events.sort()
+    # density cap: within each 4 s window keep at most max_per_sec * 4 strongest
+    cap = int(max_per_sec * 4)
+    keep = set(range(len(events)))
+    times = np.array([e[0] for e in events])
+    for i in range(len(events)):
+        j = np.where((times >= times[i] - 2) & (times <= times[i] + 2))[0]
+        if len(j) > cap:
+            order = sorted(j, key=lambda k: -events[k][2])
+            if i not in order[:cap]:
+                keep.discard(i)
+    return [(events[i][0], events[i][1]) for i in sorted(keep)]
+
+
+def local_lanes(heights: list[float], times: list[float], lanes=5, window=12.0) -> list[int]:
+    """Lane per note from pitch height relative to the notes within +-window seconds.
+
+    Notes at (nearly) the same height as the previous note keep its lane so repeated
+    pitches do not wobble between frets.
+    """
+    n = len(heights)
+    h = np.asarray(heights)
+    t = np.asarray(times)
+    out = []
+    for i in range(n):
+        m = (t >= t[i] - window) & (t <= t[i] + window)
+        loc = np.sort(h[m])
+        rank = np.searchsorted(loc, h[i], side="left") / max(1, len(loc) - 1)
+        lane = min(lanes - 1, int(rank * lanes))
+        if i and abs(h[i] - h[i - 1]) < 0.6 and t[i] - t[i - 1] < 1.0:
+            lane = out[-1]
+        out.append(lane)
+    return out

@@ -2,6 +2,7 @@
 from pathlib import Path
 
 import mido
+import numpy as np
 
 TPQ = 480
 GRID = TPQ // 4  # notes snap to 16ths
@@ -21,14 +22,26 @@ DRUM_LANE = {"K": 0, "S": 1, "H": 2, "C": 4}  # offset from the difficulty's kic
 class TempoMap:
     """Constant tempo with a lead-in beat that absorbs the first-beat offset."""
 
-    def __init__(self, bpm: float, offset: float):
+    def __init__(self, bpm: float, offset: float, snap: bool = True):
         self.spb = 60.0 / bpm
         self.lead = offset + self.spb  # first real beat (tick TPQ) falls at this time
+        self.grid = GRID if snap else 1  # snap=False keeps exact audio timing (1 tick ~ 1 ms)
 
     def tick(self, t: float) -> int:
+        g = self.grid
         if t < self.lead:
-            return int(round(t / self.lead * TPQ / GRID)) * GRID
-        return TPQ + int(round((t - self.lead) / self.spb * TPQ / GRID)) * GRID
+            return int(round(t / self.lead * TPQ / g)) * g
+        return TPQ + int(round((t - self.lead) / self.spb * TPQ / g)) * g
+
+
+def grid_fit(times, bpm: float, offset: float, div: int = 4) -> float:
+    """Mean distance of times from the nearest 1/div-beat gridline, as a fraction of the
+    grid step: 0 = perfectly on grid, 0.25 = what random timing gives."""
+    if len(times) == 0:
+        return 0.25
+    step = 60.0 / bpm / div
+    r = ((np.asarray(times) - offset) / step) % 1.0
+    return float(np.minimum(r, 1 - r).mean())
 
 
 def _thin(notes, min_gap):
@@ -90,9 +103,10 @@ def _events(notes_by_diff, drums=False):
     return ev
 
 
-def write_mid(path: Path, bpm: float, offset: float, guitar=None, bass=None, drums=None):
+def write_mid(path: Path, bpm: float, offset: float, guitar=None, bass=None, drums=None,
+              snap: bool = True):
     """Each part is a timed note list or None. Returns {part: expert note count}."""
-    tm = TempoMap(bpm, offset)
+    tm = TempoMap(bpm, offset, snap)
     mid = mido.MidiFile(type=1, ticks_per_beat=TPQ)
     tempo = mido.MidiTrack([
         mido.MetaMessage("track_name", name="", time=0),

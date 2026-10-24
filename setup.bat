@@ -14,6 +14,7 @@ echo Installing PyTorch with NVIDIA GPU support ^(large download^)...
 %PY% -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu126
 if errorlevel 1 (echo GPU build failed, falling back to CPU build... & %PY% -m pip install torch torchaudio)
 %PY% -m pip install -r requirements.txt
+%PY% -m pip install --no-deps basic-pitch
 if errorlevel 1 (echo Setup failed. & pause & exit /b 1)
 echo.
 echo Setup complete. Double-click run_app.bat to start.

@@ -4,4 +4,5 @@ customtkinter
 tkinterdnd2
 imageio-ffmpeg
 demucs
-# torch/torchaudio are installed first by setup.bat from the CUDA wheel index
+onnxruntime
+# torch/torchaudio are installed first, and basic-pitch (model file only) last, by setup.bat
