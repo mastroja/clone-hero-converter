@@ -8,7 +8,7 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import analysis, audio, chart
+from . import analysis, audio, chart, ml
 
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 STEM_TO_CH = {"other": "guitar", "bass": "bass", "drums": "drums", "vocals": "vocals"}
@@ -82,33 +82,54 @@ def make_song(src: Path, artist: str, title: str, songs_dir: Path, charter: str 
         check()
 
         on_step(2); on_progress(0.72)
-        sr = 44100
         drums_x, sr = audio.read_wav(preview_dir / "drums.wav")
-        drum_timed, env = analysis.drum_hits(drums_x, sr)
+        beatmap = None
+        if ml.available("mix"):
+            mix_x, mix_sr = audio.read_wav(wav)
+            b, d = ml.beat_times(mix_x, mix_sr)
+            if len(b) >= 16:
+                beatmap = chart.BeatMap(b, d)
+        heur_drums, env = analysis.drum_hits(drums_x, sr)
         bpm, offset = analysis.estimate_tempo(env, sr)
+        if beatmap is not None:
+            bpm = beatmap.bpm
         check()
 
-        on_step(3); on_progress(0.82)
+        on_step(3); on_progress(0.80)
         other_x, _ = audio.read_wav(preview_dir / "other.wav")
-        att = analysis.guitar_attacks(other_x, sr)
-        gtimes = [t for t, _ in att]
-        gtimed = list(zip(gtimes, analysis.local_lanes([h for _, h in att], gtimes)))
-        check()
-        on_progress(0.9)
         bass_x, _ = audio.read_wav(preview_dir / "bass.wav")
-        bp = analysis.pitched_notes(bass_x, sr, 35, 300, sensitivity=1.1, min_gap=0.12)
-        btimes = [t for t, _ in bp]
-        btimed = list(zip(btimes, analysis.local_lanes([p for _, p in bp], btimes)))
+        if ml.available("drums"):
+            drum_timed = ml.drum_notes(drums_x, sr)
+        else:
+            lane_of = {"K": 0, "S": 1, "H": 2, "C": 4}
+            drum_timed = [(t, lane_of[c], False) for t, c in heur_drums]
+        check()
+        on_progress(0.86)
+        if ml.available("guitar"):
+            gtimed = ml.fretted_notes("guitar", other_x, sr)
+        else:
+            att = analysis.guitar_attacks(other_x, sr)
+            gt_ = [t for t, _ in att]
+            gtimed = list(zip(gt_, analysis.local_lanes([h for _, h in att], gt_)))
+        check()
+        on_progress(0.90)
+        if ml.available("bass"):
+            btimed = ml.fretted_notes("bass", bass_x, sr)
+        else:
+            bp = analysis.pitched_notes(bass_x, sr, 35, 300, sensitivity=1.1, min_gap=0.12)
+            bt_ = [t for t, _ in bp]
+            btimed = list(zip(bt_, analysis.local_lanes([p for _, p in bp], bt_)))
         # Only snap to the beat grid when the song really sits on one; live or loose
         # recordings are charted at their exact audio times instead.
-        fit = chart.grid_fit(gtimes + [t for t, _ in drum_timed], bpm, offset)
-        snap = fit < 0.15
+        fit = chart.grid_fit([g[0] for g in gtimed] + [d[0] for d in drum_timed], bpm, offset)
+        snap = fit < 0.15 and beatmap is None
         check()
 
         on_step(4); on_progress(0.93)
         song_dir.mkdir(parents=True, exist_ok=True)
         counts = chart.write_mid(song_dir / "notes.mid", bpm, offset,
-                                 guitar=gtimed, bass=btimed, drums=drum_timed, snap=snap)
+                                 guitar=gtimed, bass=btimed, drums=drum_timed, snap=snap,
+                                 beatmap=beatmap)
         chart.write_ini(song_dir / "song.ini", title, artist, charter, int(length * 1000), counts,
                         preview_ms=int(min(30, max(0, length - 40)) * 1000))
         for demucs_name, ch_name in STEM_TO_CH.items():

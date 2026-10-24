@@ -1,0 +1,140 @@
+"""Learned note transcription: separated stem -> chart notes, using the trained models."""
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from . import features, nn
+
+MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
+_cache: dict = {}
+_settings: dict = {}  # per-kind decoding thresholds saved in the model file
+
+
+def available(kind: str) -> bool:
+    return (MODEL_DIR / f"{kind}.pt").exists()
+
+
+def load(kind: str, device="cuda"):
+    if kind not in _cache:
+        ck = torch.load(MODEL_DIR / f"{kind}.pt", map_location=device, weights_only=False)
+        n_out = ck.get("n_out") or ck["state"]["out.weight"].shape[0]  # older models have 5 outputs
+        m = nn.NoteNet(kind, ck.get("hidden", 128), n_out).to(device)
+        m.load_state_dict(ck["state"])
+        m.eval()
+        _cache[kind] = (m, ck.get("thr", 0.4))
+        if ck.get("decode"):
+            _settings[kind] = ck["decode"]
+    return _cache[kind]
+
+
+def to_model_rate(wave: np.ndarray, sr: int, device="cuda") -> np.ndarray:
+    if sr == features.SR:
+        return wave.astype(np.float32)
+    import torchaudio
+    x = torch.from_numpy(wave.astype(np.float32)).to(device)
+    return torchaudio.functional.resample(x, sr, features.SR).cpu().numpy()
+
+
+def probabilities(kind: str, wave: np.ndarray, sr: int, device=None) -> np.ndarray:
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    model, _ = load(kind, device)
+    feats = features.compute(to_model_rate(wave, sr, device), kind, device)
+    return nn.predict(model, feats, device)
+
+
+def hits(kind: str, prob: np.ndarray, thr=None):
+    model_thr = load(kind, "cpu")[1] if thr is None else thr
+    return nn.pick(prob, model_thr)
+
+
+# Real charts: guitar chords are mostly 2 notes and rarely 3; bass is almost all single notes.
+MAX_CHORD = {"guitar": 3, "bass": 2}
+# how sure the model must be of an extra lane, relative to the strongest one, to add it
+CHORD_RATIO = {"guitar": (0.80, 0.93), "bass": (0.88, 1.01)}
+MIN_SUSTAIN = 0.30  # seconds; shorter held notes are charted as plain notes
+
+
+def decode_settings(kind: str) -> dict:
+    """Decoding thresholds tuned on validation songs (train.calibrate), else defaults."""
+    return {"thr": 0.35, "ratios": CHORD_RATIO[kind], "hopo": 0.5, "sus": 0.5, **_settings.get(kind, {})}
+
+
+def fretted_notes(kind: str, wave: np.ndarray, sr: int):
+    """Guitar/bass -> [(time_s, (lanes...), sustain_s, hammer_on or None)]."""
+    load(kind)
+    return decode_fretted(kind, probabilities(kind, wave, sr), **decode_settings(kind))
+
+
+def decode_fretted(kind: str, prob: np.ndarray, thr=0.35, ratios=None, hopo=0.5, sus=0.5):
+    """Model probabilities -> notes.
+
+    Note times are peaks of the strongest lane probability. A second (third) lane joins
+    the note only when the model is nearly as sure of it as of the strongest lane, and
+    chords never exceed MAX_CHORD lanes. Models trained with the hammer-on/sustain outputs
+    also give each note a sustain length and a hammer-on flag; older models give 0 / None.
+    """
+    ratios = ratios or CHORD_RATIO[kind]
+    hopo_thr, sus_thr = hopo, sus
+    lanes_p = prob[:, :5]
+    has_attr = prob.shape[1] >= 7
+    onset = lanes_p.max(axis=1, keepdims=True)
+    frames = [fr for fr, _, _ in nn.pick(onset, thr)]
+    out = []
+    for k, fr in enumerate(frames):
+        seg = lanes_p[max(0, fr - 2): fr + 3].max(axis=0)
+        order = np.argsort(-seg)
+        lanes = [int(order[0])]
+        for j in range(1, MAX_CHORD[kind]):
+            if seg[order[j]] >= max(0.3, ratios[j - 1] * seg[order[0]]):
+                lanes.append(int(order[j]))
+            else:
+                break
+        length, hopo = 0.0, None
+        if has_attr:
+            hopo = bool(prob[max(0, fr - 2): fr + 3, 5].max() > hopo_thr)
+            nxt = frames[k + 1] if k + 1 < len(frames) else len(prob)
+            held = prob[fr + 2: nxt, 6] > sus_thr
+            n = int(np.argmin(held)) if not held.all() else len(held)
+            length = (n + 2) / features.FPS if n else 0.0
+            if length < MIN_SUSTAIN:
+                length = 0.0
+        out.append((fr / features.FPS, tuple(sorted(lanes)), round(length, 3), hopo))
+    return out
+
+
+def drum_notes(wave: np.ndarray, sr: int, thr=None):
+    """Drums -> [(time_s, lane 0-4, is_tom)] with lane 0 kick, 1 red, 2 yellow, 3 blue, 4 green.
+
+    Hits within ~35 ms are one moment of the kit; each moment keeps at most one hit per lane
+    (cymbal or tom, whichever is likelier), one kick and the two likeliest hand hits, since a
+    drummer has two hands.
+    """
+    prob = probabilities("drums", wave, sr)
+    raw = []
+    for fr, c, p in hits("drums", prob, thr):
+        lane = 0 if c == 0 else 1 if c == 1 else 2 + (c - 2) // 2
+        raw.append((fr, lane, bool(c >= 2 and (c - 2) % 2 == 1), p))
+    out, k = [], 0
+    while k < len(raw):
+        j = k
+        while j + 1 < len(raw) and raw[j + 1][0] - raw[k][0] <= 3:
+            j += 1
+        group = raw[k:j + 1]
+        k = j + 1
+        best = {}
+        for h in group:
+            if h[1] not in best or h[3] > best[h[1]][3]:
+                best[h[1]] = h
+        hands = sorted((h for l, h in best.items() if l != 0), key=lambda h: -h[3])[:2]
+        keep = hands + ([best[0]] if 0 in best else [])
+        t = max(keep, key=lambda h: h[3])[0] / features.FPS  # one shared time keeps it one chord
+        out += [(t, h[1], h[2]) for h in keep]
+    return sorted(out)
+
+
+def beat_times(wave: np.ndarray, sr: int):
+    """Full-song audio -> (beat_times, downbeat_times) in seconds."""
+    from . import beats
+    prob = probabilities("mix", wave, sr)
+    return beats.track(prob[:, 0], prob[:, 1])
