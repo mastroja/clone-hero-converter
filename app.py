@@ -12,7 +12,7 @@ from pathlib import Path
 import customtkinter as ctk
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
-from chc import pipeline
+from chc import pipeline, tidy
 
 try:
     import winsound
@@ -92,6 +92,9 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.header(f, "Clone Hero Converter",
                     "Drop in a song and get a ready-to-play Clone Hero chart, split into "
                     "guitar, bass, drums and vocals.")
+        ctk.CTkButton(f, text="⚙  Settings", width=110, height=32, fg_color=CARD,
+                      hover_color=CARD_HOVER, text_color=("#222", "#eee"),
+                      command=self.show_settings).place(relx=1.0, y=4, anchor="ne")
         self.drop = ctk.CTkFrame(f, fg_color=CARD, corner_radius=18, border_width=2,
                                  border_color=ACCENT, height=190)
         self.drop.pack(fill="x")
@@ -172,6 +175,143 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self.folder_lbl.configure(text=d)
             self.cfg["songs_dir"] = d
             save_config(self.cfg)
+
+    # ---------- settings ----------
+    def back_button(self, parent, command=None):
+        ctk.CTkButton(parent, text="←  Back", width=90, height=32, fg_color=CARD,
+                      hover_color=CARD_HOVER, text_color=("#222", "#eee"),
+                      command=command or self.show_home).pack(anchor="w", pady=(0, 10))
+
+    def show_settings(self):
+        f = ctk.CTkFrame(self, fg_color="transparent")
+        self.back_button(f)
+        self.header(f, "Settings")
+
+        card = ctk.CTkFrame(f, fg_color=CARD, corner_radius=14)
+        card.pack(fill="x", pady=(0, 12))
+        ctk.CTkLabel(card, text="Songs folder", font=ctk.CTkFont(size=15, weight="bold")).pack(
+            anchor="w", padx=16, pady=(12, 0))
+        ctk.CTkLabel(card, text="Where new songs are saved, and which folder gets tidied.",
+                     text_color=MUTED).pack(anchor="w", padx=16)
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.pack(fill="x", padx=16, pady=(6, 14))
+        lbl = ctk.CTkLabel(row, text=str(self.songs_dir), anchor="w")
+        lbl.pack(side="left", fill="x", expand=True)
+
+        def change():
+            from tkinter import filedialog
+            d = filedialog.askdirectory(title="Songs folder",
+                                        initialdir=str(self.songs_dir) if self.songs_dir.exists() else None)
+            if d:
+                self.songs_dir = Path(d)
+                lbl.configure(text=d)
+                self.cfg["songs_dir"] = d
+                save_config(self.cfg)
+        ctk.CTkButton(row, text="Change", width=80, command=change, fg_color=ACCENT,
+                      hover_color=ACCENT_HOVER).pack(side="right")
+
+        card2 = ctk.CTkFrame(f, fg_color=CARD, corner_radius=14)
+        card2.pack(fill="x", pady=(0, 12))
+        ctk.CTkLabel(card2, text="Charter name", font=ctk.CTkFont(size=15, weight="bold")).pack(
+            anchor="w", padx=16, pady=(12, 0))
+        ctk.CTkLabel(card2, text="Written into song.ini for songs you make.",
+                     text_color=MUTED).pack(anchor="w", padx=16)
+        charter = ctk.CTkEntry(card2, height=36)
+        charter.insert(0, self.cfg.get("charter", ""))
+        charter.pack(fill="x", padx=16, pady=(6, 14))
+
+        def save_charter(_e=None):
+            self.cfg["charter"] = charter.get().strip()
+            save_config(self.cfg)
+        charter.bind("<FocusOut>", save_charter)
+        charter.bind("<Return>", save_charter)
+
+        card3 = ctk.CTkFrame(f, fg_color=CARD, corner_radius=14)
+        card3.pack(fill="x")
+        ctk.CTkLabel(card3, text="Tidy song names", font=ctk.CTkFont(size=15, weight="bold")).pack(
+            anchor="w", padx=16, pady=(12, 0))
+        ctk.CTkLabel(card3, text="Scan your songs folder and clean up names like "
+                                 "\u201cArtist - Song (Live) (Harmonix)\u201d \u2192 \u201cArtist - Song\u201d. "
+                                 "You review every change first, and it can be undone.",
+                     text_color=MUTED, wraplength=680, justify="left").pack(anchor="w", padx=16)
+        ctk.CTkButton(card3, text="Scan songs folder...", height=38, fg_color=ACCENT,
+                      hover_color=ACCENT_HOVER, command=lambda: (save_charter(), self.show_tidy())
+                      ).pack(anchor="w", padx=16, pady=(8, 14))
+        self.switch(f)
+
+    # ---------- tidy names ----------
+    def show_tidy(self, message=""):
+        f = ctk.CTkFrame(self, fg_color="transparent")
+        self.back_button(f, self.show_settings)
+        self.header(f, "Tidy song names", str(self.songs_dir))
+        self.tidy_parens = ctk.BooleanVar(value=self.cfg.get("tidy_parens", True))
+        self.tidy_brackets = ctk.BooleanVar(value=self.cfg.get("tidy_brackets", True))
+        opts = ctk.CTkFrame(f, fg_color="transparent")
+        opts.pack(fill="x")
+        ctk.CTkCheckBox(opts, text="Remove (parentheses)", variable=self.tidy_parens,
+                        command=self.rescan).pack(side="left")
+        ctk.CTkCheckBox(opts, text="Remove [brackets]", variable=self.tidy_brackets,
+                        command=self.rescan).pack(side="left", padx=18)
+        self.tidy_msg = ctk.CTkLabel(f, text=message, text_color=GOOD, anchor="w")
+        self.tidy_msg.pack(fill="x", pady=(8, 0))
+        self.tidy_list = ctk.CTkScrollableFrame(f, fg_color=CARD, corner_radius=12, height=300)
+        self.tidy_list.pack(fill="both", expand=True, pady=8)
+        bar = ctk.CTkFrame(f, fg_color="transparent")
+        bar.pack(fill="x")
+        self.tidy_apply = ctk.CTkButton(bar, text="Rename selected", height=42, fg_color=ACCENT,
+                                        hover_color=ACCENT_HOVER, command=self.apply_tidy)
+        self.tidy_apply.pack(side="left", expand=True, fill="x")
+        self.tidy_undo = ctk.CTkButton(bar, text="Undo last rename", height=42, fg_color=CARD,
+                                       hover_color=CARD_HOVER, text_color=("#222", "#eee"),
+                                       command=self.undo_tidy)
+        self.tidy_undo.pack(side="left", expand=True, fill="x", padx=(12, 0))
+        self.switch(f)
+        self.rescan()
+
+    def rescan(self):
+        self.cfg["tidy_parens"] = self.tidy_parens.get()
+        self.cfg["tidy_brackets"] = self.tidy_brackets.get()
+        save_config(self.cfg)
+        for w in self.tidy_list.winfo_children():
+            w.destroy()
+        self.proposals = []
+        if not self.songs_dir.exists():
+            ctk.CTkLabel(self.tidy_list, text="The songs folder does not exist yet.",
+                         text_color=MUTED).pack(pady=20)
+        else:
+            self.proposals = tidy.scan(self.songs_dir, self.tidy_parens.get(), self.tidy_brackets.get())
+        self.tidy_vars = []
+        for p in self.proposals:
+            var = ctk.BooleanVar(value=p.selected)
+            self.tidy_vars.append(var)
+            row = ctk.CTkFrame(self.tidy_list, fg_color="transparent")
+            row.pack(fill="x", pady=3, padx=6)
+            ctk.CTkCheckBox(row, text="", variable=var, width=24,
+                            state="normal" if p.ok else "disabled").pack(side="left")
+            txt = ctk.CTkFrame(row, fg_color="transparent")
+            txt.pack(side="left", fill="x", expand=True)
+            ctk.CTkLabel(txt, text=p.path.name, anchor="w", text_color=MUTED, wraplength=640,
+                         justify="left").pack(fill="x")
+            ctk.CTkLabel(txt, text="\u2192  " + p.new_name + (f"   (skipped: {p.note})" if p.note else ""),
+                         anchor="w", wraplength=640, justify="left",
+                         text_color=("#111", "#fff") if p.ok else "#e0a23a").pack(fill="x")
+        if self.songs_dir.exists() and not self.proposals:
+            ctk.CTkLabel(self.tidy_list, text="Nothing to tidy. All song names are already clean.",
+                         text_color=MUTED).pack(pady=24)
+        self.tidy_apply.configure(state="normal" if any(p.ok for p in self.proposals) else "disabled")
+        self.tidy_undo.configure(state="normal" if tidy.can_undo(self.songs_dir) else "disabled")
+
+    def apply_tidy(self):
+        for p, v in zip(self.proposals, self.tidy_vars):
+            p.selected = v.get()
+        n, errs = tidy.apply(self.proposals, self.songs_dir, self.tidy_parens.get(),
+                             self.tidy_brackets.get())
+        msg = f"Renamed {n} folder{'s' if n != 1 else ''}." + (f" {len(errs)} failed: {errs[0]}" if errs else "")
+        self.show_tidy(msg)
+
+    def undo_tidy(self):
+        n, errs = tidy.undo(self.songs_dir)
+        self.show_tidy(f"Restored {n} folder name{'s' if n != 1 else ''}." + (f" {errs[0]}" if errs else ""))
 
     # ---------- progress ----------
     def start(self):

@@ -14,6 +14,13 @@ vocals, plus an automatic first-draft chart on all four difficulties.
 
 A graphics card makes it much faster (about 11 seconds for 40 seconds of music on an RTX 4070 Ti).
 
+## Tidy song names
+**Settings > Scan songs folder** finds song folders named like `Jimi Hendrix - Voodoo Child (Slight Return)
+(Live) (Harmonix)` and proposes `Jimi Hendrix - Voodoo Child`. You tick the ones you want, press
+**Rename selected**, and can **Undo last rename**. It also cleans the `name =` line in each `song.ini`.
+Folders that would collide with an existing name are skipped. It never touches song files or
+`song.ini` artist/album.
+
 ## What comes out
 `<Artist - Title>/` containing `guitar.ogg` (everything that is not drums, bass or vocals), `bass.ogg`,
 `drums.ogg`, `vocals.ogg`, `notes.mid` and `song.ini`.
