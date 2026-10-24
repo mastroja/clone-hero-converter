@@ -50,11 +50,13 @@ def to_model_rate(wave: np.ndarray, sr: int, device="cuda") -> np.ndarray:
     return torchaudio.functional.resample(x, sr, features.SR).cpu().numpy()
 
 
-def probabilities(kind: str, wave: np.ndarray, sr: int, device=None) -> np.ndarray:
+def probabilities(kind: str, wave: np.ndarray, sr: int, device=None, with_features=False):
+    """Per-frame model probabilities (T, outputs); with_features also returns the input features."""
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model, _ = load(kind, device)
     feats = features.compute(to_model_rate(wave, sr, device), _meta[kind]["features"], device)
-    return nn.predict(model, feats, device)
+    prob = nn.predict(model, feats, device)
+    return (prob, feats) if with_features else prob
 
 
 def hits(kind: str, prob: np.ndarray, thr=None):
@@ -119,10 +121,13 @@ def follow_directions(lanes, segs, rel_p, weight):
     return [tuple(sorted(l - lo + a for l in ln)) for ln, lo, a in zip(lanes, lowest, anchors)]
 
 
-def fretted_notes(kind: str, wave: np.ndarray, sr: int):
-    """Guitar/bass -> [(time_s, (lanes...), sustain_s, hammer_on or None)]."""
+def fretted_notes(kind: str, wave: np.ndarray, sr: int, with_features=False):
+    """Guitar/bass -> [(time_s, (lanes...), sustain_s, hammer_on or None, confidence)]
+    (plus the model's input features with with_features, for finding repeated sections)."""
     load(kind)
-    return decode_fretted(kind, probabilities(kind, wave, sr), **decode_settings(kind))
+    prob, feats = probabilities(kind, wave, sr, with_features=True)
+    notes = decode_fretted(kind, prob, **decode_settings(kind))
+    return (notes, feats) if with_features else notes
 
 
 def decode_fretted(kind: str, prob: np.ndarray, thr=0.35, ratios=None, hopo=0.5, sus=0.5, rel=1.0):
@@ -163,21 +168,23 @@ def decode_fretted(kind: str, prob: np.ndarray, thr=0.35, ratios=None, hopo=0.5,
             length = (n + 2) / features.FPS if n else 0.0
             if length < MIN_SUSTAIN:
                 length = 0.0
-        out.append((fr / features.FPS, tuple(sorted(lanes)), round(length, 3), hopo))
+        out.append((fr / features.FPS, tuple(sorted(lanes)), round(length, 3), hopo, float(seg[order[0]])))
     if has_rel and rel > 0 and out:
         placed = follow_directions([n[1] for n in out], segs, rels, rel)
-        out = [(n[0], lanes, n[2], n[3]) for n, lanes in zip(out, placed)]
+        out = [(n[0], lanes, *n[2:]) for n, lanes in zip(out, placed)]
     return out
 
 
-def drum_notes(wave: np.ndarray, sr: int, thr=None):
-    """Drums -> [(time_s, lane 0-4, is_tom)] with lane 0 kick, 1 red, 2 yellow, 3 blue, 4 green.
+def drum_notes(wave: np.ndarray, sr: int, thr=None, with_features=False):
+    """Drums -> [(time_s, lane 0-4, is_tom, confidence)] with lane 0 kick, 1 red, 2 yellow, 3 blue, 4 green.
 
     Hits within ~35 ms are one moment of the kit; each moment keeps at most one hit per lane
     (cymbal or tom, whichever is likelier), one kick and the two likeliest hand hits, since a
     drummer has two hands.
     """
-    return decode_drums(probabilities("drums", wave, sr), thr)
+    prob, feats = probabilities("drums", wave, sr, with_features=True)
+    notes = decode_drums(prob, thr)
+    return (notes, feats) if with_features else notes
 
 
 def decode_drums(prob: np.ndarray, thr=None):
@@ -200,7 +207,7 @@ def decode_drums(prob: np.ndarray, thr=None):
         hands = sorted((h for l, h in best.items() if l != 0), key=lambda h: -h[3])[:2]
         keep = hands + ([best[0]] if 0 in best else [])
         t = max(keep, key=lambda h: h[3])[0] / features.FPS  # one shared time keeps it one chord
-        out += [(t, h[1], h[2]) for h in keep]
+        out += [(t, h[1], h[2], h[3]) for h in keep]
     return sorted(out)
 
 

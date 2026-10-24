@@ -8,7 +8,7 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import analysis, audio, chart, ml
+from . import analysis, audio, chart, ml, structure
 
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 STEM_TO_CH = {"other": "guitar", "bass": "bass", "drums": "drums", "vocals": "vocals"}
@@ -106,15 +106,16 @@ def make_song(src: Path, artist: str, title: str, songs_dir: Path, charter: str 
         on_step(3); on_progress(0.80)
         other_x, _ = audio.read_wav(guitar_wav)
         bass_x, _ = audio.read_wav(preview_dir / "bass.wav")
+        feats = {}  # model input features per part, for finding repeated sections
         if ml.available("drums"):
-            drum_timed = ml.drum_notes(drums_x, sr)
+            drum_timed, feats["drums"] = ml.drum_notes(drums_x, sr, with_features=True)
         else:
             lane_of = {"K": 0, "S": 1, "H": 2, "C": 4}
             drum_timed = [(t, lane_of[c], False) for t, c in heur_drums]
         check()
         on_progress(0.86)
         if ml.available("guitar"):
-            gtimed = ml.fretted_notes("guitar", other_x, sr)
+            gtimed, feats["guitar"] = ml.fretted_notes("guitar", other_x, sr, with_features=True)
         else:
             att = analysis.guitar_attacks(other_x, sr)
             gt_ = [t for t, _ in att]
@@ -122,15 +123,23 @@ def make_song(src: Path, artist: str, title: str, songs_dir: Path, charter: str 
         check()
         on_progress(0.90)
         if ml.available("bass"):
-            btimed = ml.fretted_notes("bass", bass_x, sr)
+            btimed, feats["bass"] = ml.fretted_notes("bass", bass_x, sr, with_features=True)
         else:
             bp = analysis.pitched_notes(bass_x, sr, 35, 300, sensitivity=1.1, min_gap=0.12)
             bt_ = [t for t, _ in bp]
             btimed = list(zip(bt_, analysis.local_lanes([p for _, p in bp], bt_)))
-        # Only snap to the beat grid when the song really sits on one; live or loose
-        # recordings are charted at their exact audio times instead.
-        fit = chart.grid_fit([g[0] for g in gtimed] + [d[0] for d in drum_timed], bpm, offset)
-        snap = fit < 0.15 and beatmap is None
+        if beatmap is not None:
+            # every note on its bar's grid, and repeated sections charted the same way
+            snap = True
+            parts = {"guitar": gtimed, "bass": btimed, "drums": drum_timed}
+            for k, f in feats.items():
+                parts[k] = structure.make_consistent(k, parts[k], f, beatmap)
+            gtimed, btimed, drum_timed = parts["guitar"], parts["bass"], parts["drums"]
+        else:
+            # No tracked beats: only snap to a fixed grid when the song really sits on one;
+            # live or loose recordings are charted at their exact audio times instead.
+            fit = chart.grid_fit([g[0] for g in gtimed] + [d[0] for d in drum_timed], bpm, offset)
+            snap = fit < 0.15
         check()
 
         on_step(4); on_progress(0.93)

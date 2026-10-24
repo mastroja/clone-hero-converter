@@ -17,6 +17,11 @@ DRUM_RULES = {
     "easy": [480, 480, None, None, None],
 }
 TOM_MARK = {2: 110, 3: 111, 4: 112}
+# BeatMap.fit_grid: how much better (in 16th-note steps moved) a bar must fit 8th-note triplets
+# than straight 16ths to be charted as a shuffle, and below what margin a bar is undecided and
+# follows the song's usual feel. Tuned on validation songs (train.eval_chart).
+STRAIGHT_BIAS = 0.5
+UNDECIDED = 0.3
 
 
 class TempoMap:
@@ -42,9 +47,12 @@ class BeatMap:
     tracked downbeat.
     """
 
-    def __init__(self, beats, downbeats=None, snap=True, tol=0.015):
+    def __init__(self, beats, downbeats=None, snap=True, tol=0.015, smooth=0):
         b = np.asarray(beats, float)
+        if smooth:
+            b = smooth_beats(b, smooth)
         self.snap = snap
+        self.bar_grid = None  # per-bar grid step in ticks, set by fit_grid
         n = len(b)
         # lead-in: s beats between time 0 and the first tracked beat, so a downbeat lands on a bar line
         s = 1
@@ -78,10 +86,60 @@ class BeatMap:
         i, t0, P = self.segs[k]
         return (i + s) * TPQ + (t - t0) / P * TPQ
 
+    def fit_grid(self, times, straight_bias=None, undecided=None):
+        """Choose each bar's grid from the notes in it: straight 16ths or 8th-note triplets
+        (a shuffle), or the 32nd / 16th-triplet grid for fast runs that would otherwise land on
+        top of each other. Bars with too few notes to tell follow the song's usual feel.
+        After this, tick() always snaps to the bar's grid, as real charts do."""
+        straight_bias = STRAIGHT_BIAS if straight_bias is None else straight_bias
+        undecided = UNDECIDED if undecided is None else undecided
+        raw = np.array(sorted(self.raw_tick(t) for t in times))
+        if not len(raw):
+            self.bar_grid = None
+            return
+        BAR = 4 * TPQ
+        bars = (raw // BAR).astype(int)
+        # extra cost of a grid: a triplet bar needs a little more evidence than a straight one
+        # (straight_bias per bar), and the fine grids, only tried for runs the coarse ones would
+        # collapse, cost 0.2 per note
+        cost = {GRID: 0.0, TPQ // 3: straight_bias}
+        finer = {GRID: (GRID // 2, 0.2), TPQ // 3: (TPQ // 6, 0.2)}
+        choice, strength = {}, {}
+
+        def score(r, g, per_bar, per_note=0.0):
+            snapped = np.round(r / g) * g
+            collide = len(r) - len(np.unique(snapped))
+            # distance moved in 16th-note steps, plus one per note lost to a collision
+            return np.abs(snapped - r).sum() / GRID + per_bar + per_note * len(r) + collide, collide
+
+        for k in np.unique(bars):
+            r = raw[bars == k]
+            scores = {}
+            for g, c in cost.items():
+                scores[g], collide = score(r, g, c)
+                if collide:  # a fast run: also try the finer grid of the same feel
+                    fg, fc = finer[g]
+                    scores[fg] = score(r, fg, c, fc)[0]
+            best = min(scores, key=scores.get)
+            choice[int(k)] = best
+            vals = sorted(scores.values())
+            strength[int(k)] = (vals[1] - vals[0]) if len(vals) > 1 else 0.0
+            if len(r) < 3:
+                strength[int(k)] = 0.0
+        straight = sum(1 for g in choice.values() if g in (GRID, GRID // 2))
+        usual = GRID if straight >= len(choice) / 2 else TPQ // 3
+        for k in choice:  # undecided bars take the song's usual feel
+            if strength[k] < undecided and choice[k] in (GRID, TPQ // 3):
+                choice[k] = usual
+        self.bar_grid, self.usual_grid = choice, usual
+
     def tick(self, t: float) -> int:
         raw = self.raw_tick(t)
         if not self.snap:
             return int(round(raw))
+        if self.bar_grid is not None:
+            g = self.bar_grid.get(int(raw // (4 * TPQ)), self.usual_grid)
+            return int(round(raw / g)) * g
         # snap to the nearest 16th or 12th-of-a-beat grid point if it is acoustically close
         k = max(0, int(np.searchsorted(self.seg_times, t, side="right")) - 1)
         spb = self.segs[k][2] if t >= self.segs[0][1] else self.lead_len / self.lead_beats
@@ -113,6 +171,19 @@ class BeatMap:
     def bpm(self) -> float:
         Ps = np.array([P for _, _, P in self.segs])
         return round(float(60.0 / np.median(Ps)), 1)
+
+
+def smooth_beats(b: np.ndarray, half: int = 4) -> np.ndarray:
+    """Even out beat-tracker jitter: each beat moves onto a straight line fitted through its
+    neighbours (half beats either side), so the tempo follows real drift but not the wobble."""
+    out = b.copy()
+    n = len(b)
+    for i in range(n):
+        lo, hi = max(0, i - half), min(n, i + half + 1)
+        idx = np.arange(lo, hi)
+        if len(idx) >= 3:
+            out[i] = np.polyval(np.polyfit(idx, b[lo:hi], 1), i)
+    return np.maximum.accumulate(out)
 
 
 def grid_fit(times, bpm: float, offset: float, div: int = 4) -> float:
@@ -152,12 +223,10 @@ def guitar_notes(timed, tm: TempoMap, difficulty: str):
         length = n[2] if len(n) > 2 else 0.0
         hopo = n[3] if len(n) > 3 else None
         tick = tm.tick(t)
-        cur = by_tick.setdefault(tick, [set(), 0, None])
-        cur[0].update(l * nlanes // 5 for l in lanes)
-        if length > 0:
-            cur[1] = max(cur[1], tm.tick(t + length) - tick)
-        if hopo is not None:
-            cur[2] = hopo if cur[2] is None else cur[2] or hopo
+        if tick in by_tick:
+            continue  # two notes snapped onto one spot: keep the first, don't invent a chord
+        by_tick[tick] = [{l * nlanes // 5 for l in lanes},
+                         tm.tick(t + length) - tick if length > 0 else 0, hopo]
     notes = []
     for tick in sorted(by_tick):
         lanes, length, hopo = by_tick[tick]
@@ -184,14 +253,19 @@ def guitar_notes(timed, tm: TempoMap, difficulty: str):
 
 def drum_notes(timed, tm: TempoMap, difficulty: str):
     """timed: [(seconds, lane 0-4, is_tom)] -> [(tick, lane, is_tom)] reduced for the difficulty."""
-    rules, last, out, seen = DRUM_RULES[difficulty], {}, [], set()
-    for t, lane, tom in sorted(timed):
+    rules, last, out, seen, hands = DRUM_RULES[difficulty], {}, [], set(), {}
+    for d in sorted(timed):
+        t, lane, tom = d[:3]
         gap = rules[lane]
         tick = tm.tick(t)
         if gap is None or (tick, lane) in seen:
             continue
         if tick - last.get(lane, -10 ** 9) < gap:
             continue
+        if lane and hands.get(tick, 0) >= 2:
+            continue  # snapping merged two moments: still only two hands
+        if lane:
+            hands[tick] = hands.get(tick, 0) + 1
         seen.add((tick, lane))
         last[lane] = tick
         out.append((tick, lane, bool(tom)))
@@ -229,8 +303,11 @@ def _events(notes_by_diff, drums=False):
 
 
 def write_mid(path: Path, bpm: float, offset: float, guitar=None, bass=None, drums=None,
-              snap: bool = True, beatmap: "BeatMap | None" = None):
-    """Each part is a timed note list or None. Returns {part: expert note count}."""
+              snap: bool = True, beatmap: "BeatMap | None" = None, grid: bool = True):
+    """Each part is a timed note list or None. Returns {part: expert note count}.
+
+    grid (with a beatmap): snap every note to its bar's straight or triplet grid
+    (BeatMap.fit_grid); otherwise only notes already close to a grid line are snapped."""
     tm = beatmap if beatmap is not None else TempoMap(bpm, offset, snap)
     mid = mido.MidiFile(type=1, ticks_per_beat=TPQ)
     if beatmap is not None:
@@ -255,6 +332,11 @@ def write_mid(path: Path, bpm: float, offset: float, guitar=None, bass=None, dru
                             ("PART DRUMS", drums, drum_notes)):
         if not timed:
             continue
+        if beatmap is not None and snap:
+            if grid:
+                beatmap.fit_grid([n[0] for n in timed])
+            else:
+                beatmap.bar_grid = None
         by_diff = {d: fn(timed, tm, d) for d in DIFF_BASE}
         mid.tracks.append(_track(name, _events(by_diff, drums=fn is drum_notes)))
         counts[name] = len({n[0] for n in by_diff["expert"]})  # notes and chords, not lanes

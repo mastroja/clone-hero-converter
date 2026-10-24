@@ -38,7 +38,7 @@ def score(inst, ck, kind, model, layout, rows):
         for i, s in rows:
             p = cnn.predict(model, np.load(layout.dm(i, s, kind)), "cuda")
             got = ml.decode_drums(p, ck.get("thr"))
-            pred = [(t, drum_channel(l, tom)) for t, l, tom in got]
+            pred = [(d[0], drum_channel(d[1], d[2])) for d in got]
             truth = data.events(s, inst)
             a, b, c = data.f1(pred, truth, 8)
             tp, fp, fn = tp + a, fp + b, fn + c
