@@ -11,6 +11,12 @@ Demucs needs the CUDA build of torch (a plain `pip install demucs` gives CPU-onl
 
 Optional: put `ffmpeg` on PATH so stems are written as .ogg instead of .wav.
 
+## GUI
+Double-click `run_app.bat` (or `python app.py`). Needs `python -m pip install mido` plus
+the Demucs setup above, using the same Python. Tab 1 queues files and separates stems into song
+folders (progress bar, live log, cancel). Tab 2 converts a MIDI to `notes.mid`, with a source-track
+picker. Settings are remembered in `~/.clone_hero_converter.json`. The CLI scripts below still work.
+
 ## 1. Split stems into song folders
     python separate.py "D:\inbox" -o "G:\Songs\Clone Hero" --charter you
 

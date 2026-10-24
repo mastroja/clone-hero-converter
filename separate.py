@@ -10,11 +10,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 AUDIO_EXT = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".opus"}
 # Demucs stem -> Clone Hero audio file name
 STEM_MAP = {"other": "guitar", "bass": "bass", "drums": "drums", "vocals": "vocals"}
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 INI_TEMPLATE = """[song]
 name = {title}
@@ -33,6 +35,10 @@ preview_start_time = 0
 """
 
 
+class Cancelled(Exception):
+    pass
+
+
 def split_name(stem: str) -> tuple[str, str]:
     if " - " in stem:
         artist, title = stem.split(" - ", 1)
@@ -40,42 +46,93 @@ def split_name(stem: str) -> tuple[str, str]:
     return "Unknown", stem.strip()
 
 
-def run_demucs(src: Path, tmp: Path, model: str, device: str) -> Path:
-    cmd = [sys.executable, "-m", "demucs", "-n", model, "--device", device,
-           "-o", str(tmp), str(src)]
-    subprocess.run(cmd, check=True)
-    return tmp / model / src.stem
+def collect_audio(path: Path) -> list[Path]:
+    if path.is_file():
+        return [path]
+    return sorted(f for f in path.iterdir() if f.suffix.lower() in AUDIO_EXT)
 
 
-def encode(wav: Path, dest: Path, ffmpeg: str | None) -> Path:
+def run_streamed(cmd, log, stop: threading.Event | None):
+    """Run cmd, forwarding output (split on \\r and \\n) to log; honours stop."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            creationflags=NO_WINDOW)
+    buf = b""
+    while True:
+        if stop and stop.is_set():
+            proc.terminate()
+            proc.wait()
+            raise Cancelled()
+        ch = proc.stdout.read(1)
+        if not ch:
+            break
+        if ch in (b"\r", b"\n"):
+            if buf.strip():
+                log(buf.decode("utf-8", "replace").strip(), progress=ch == b"\r")
+            buf = b""
+        else:
+            buf += ch
+    if proc.wait() != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
+
+
+def encode(wav: Path, dest: Path, ffmpeg, log, stop) -> Path:
     if ffmpeg:
         out = dest.with_suffix(".ogg")
-        subprocess.run([ffmpeg, "-y", "-loglevel", "error", "-i", str(wav),
-                        "-c:a", "libvorbis", "-q:a", "6", str(out)], check=True)
+        run_streamed([ffmpeg, "-y", "-loglevel", "error", "-i", str(wav),
+                      "-c:a", "libvorbis", "-q:a", "6", str(out)], log, stop)
         return out
     out = dest.with_suffix(".wav")
     shutil.copy2(wav, out)
     return out
 
 
-def process(src: Path, out_root: Path, args, ffmpeg) -> None:
+def process(src: Path, out_root: Path, model, device, charter, force, ffmpeg, log, stop):
     artist, title = split_name(src.stem)
     song_dir = out_root / src.stem
-    if song_dir.exists() and not args.force and (song_dir / "song.ini").exists():
-        print(f"skip (exists): {src.name}")
+    if song_dir.exists() and not force and (song_dir / "song.ini").exists():
+        log(f"skip (exists): {src.name}")
         return
     song_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as t:
-        stems = run_demucs(src, Path(t), args.model, args.device)
+        run_streamed([sys.executable, "-m", "demucs", "-n", model, "--device", device,
+                      "-o", t, str(src)], log, stop)
+        stems = Path(t) / model / src.stem
         for demucs_name, ch_name in STEM_MAP.items():
             wav = stems / f"{demucs_name}.wav"
             if wav.exists():
-                encode(wav, song_dir / ch_name, ffmpeg)
+                log(f"encoding {ch_name}")
+                encode(wav, song_dir / ch_name, ffmpeg, log, stop)
     ini = song_dir / "song.ini"
-    if not ini.exists() or args.force:
-        ini.write_text(INI_TEMPLATE.format(title=title, artist=artist,
-                                           charter=args.charter), encoding="utf-8")
-    print(f"done: {song_dir}")
+    if not ini.exists() or force:
+        ini.write_text(INI_TEMPLATE.format(title=title, artist=artist, charter=charter),
+                       encoding="utf-8")
+    log(f"done: {song_dir}")
+
+
+def run_batch(files, out_root: Path, model="htdemucs_ft", device="cuda", charter="",
+              force=False, log=lambda m, progress=False: print(m), stop: threading.Event | None = None,
+              on_item=None) -> int:
+    """Process files; returns number of failures. on_item(i, total, name) is optional."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        log("ffmpeg not found: stems will be kept as .wav (large)")
+    out_root.mkdir(parents=True, exist_ok=True)
+    failures = 0
+    for i, f in enumerate(files):
+        if on_item:
+            on_item(i, len(files), f.name)
+        log(f"=== {f.name}")
+        try:
+            process(f, out_root, model, device, charter, force, ffmpeg, log, stop)
+        except Cancelled:
+            log("cancelled")
+            return failures
+        except subprocess.CalledProcessError as e:
+            failures += 1
+            log(f"FAILED {f.name}: {e}")
+    if on_item:
+        on_item(len(files), len(files), "")
+    return failures
 
 
 def main() -> None:
@@ -88,20 +145,11 @@ def main() -> None:
     p.add_argument("--charter", default="")
     p.add_argument("--force", action="store_true", help="redo songs that already exist")
     args = p.parse_args()
-
-    files = [args.input] if args.input.is_file() else sorted(
-        f for f in args.input.iterdir() if f.suffix.lower() in AUDIO_EXT)
+    files = collect_audio(args.input)
     if not files:
         sys.exit("no audio files found")
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        print("ffmpeg not found: stems will be kept as .wav (large)")
-    args.out.mkdir(parents=True, exist_ok=True)
-    for f in files:
-        try:
-            process(f, args.out, args, ffmpeg)
-        except subprocess.CalledProcessError as e:
-            print(f"FAILED {f.name}: {e}", file=sys.stderr)
+    run_batch(files, args.out, args.model, args.device, args.charter, args.force,
+              log=lambda m, progress=False: print(m))
 
 
 if __name__ == "__main__":

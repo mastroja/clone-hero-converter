@@ -140,23 +140,24 @@ def drum_events(notes, tpq):
     return ev
 
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("input", type=Path)
-    p.add_argument("output", type=Path, nargs="?", help="default: notes.mid next to input")
-    p.add_argument("-i", "--instrument", choices=TRACK_NAMES, default="guitar")
-    p.add_argument("-t", "--track", help="source track index or name (default: busiest)")
-    p.add_argument("--lane-mode", choices=["quantile", "contour", "single"], default="quantile")
-    p.add_argument("--min-gap", type=float, default=0.125,
-                   help="min beats between guitar notes (thins noisy transcriptions)")
-    p.add_argument("--sustains", action="store_true", help="keep long notes as sustains")
-    args = p.parse_args()
+def list_tracks(path):
+    """[(index, name, note_count)] for tracks that contain notes."""
+    mid = mido.MidiFile(path)
+    return [(i, tr.name, sum(m.type == "note_on" and m.velocity > 0 for m in tr))
+            for i, tr in enumerate(mid.tracks)
+            if any(m.type == "note_on" for m in tr)]
 
-    src = mido.MidiFile(args.input)
+
+def convert(input, output=None, instrument="guitar", track=None,
+            lane_mode="quantile", min_gap=0.125, sustains=False):
+    """Write a Clone Hero MIDI; returns (output_path, note_count)."""
+    args = argparse.Namespace(instrument=instrument, lane_mode=lane_mode,
+                              min_gap=min_gap, sustains=sustains)
+    input = Path(input)
+    src = mido.MidiFile(input)
     tpq = src.ticks_per_beat
-    notes = read_notes(src, args.track)
-    events = drum_events(notes, tpq) if args.instrument == "drums" else guitar_events(notes, tpq, args)
+    notes = read_notes(src, track)
+    events = drum_events(notes, tpq) if instrument == "drums" else guitar_events(notes, tpq, args)
 
     out = mido.MidiFile(type=1, ticks_per_beat=tpq)
     tempo = mido.MidiTrack()  # tempo map: copy meta events from the source, drop names
@@ -173,10 +174,26 @@ def main():
     tm.append(mido.MetaMessage("end_of_track", time=0))
     out.tracks += [tm, mido.MidiTrack([mido.MetaMessage("track_name", name="EVENTS", time=0),
                                        mido.MetaMessage("end_of_track", time=0)]),
-                   build_track(TRACK_NAMES[args.instrument], events)]
-    dest = args.output or args.input.with_name("notes.mid")
+                   build_track(TRACK_NAMES[instrument], events)]
+    dest = Path(output) if output else input.with_name("notes.mid")
     out.save(dest)
-    print(f"wrote {dest}: {sum(e[1] == 'note_on' for e in events)} note-ons on {TRACK_NAMES[args.instrument]}")
+    return dest, sum(e[1] == "note_on" for e in events)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("input", type=Path)
+    p.add_argument("output", type=Path, nargs="?", help="default: notes.mid next to input")
+    p.add_argument("-i", "--instrument", choices=TRACK_NAMES, default="guitar")
+    p.add_argument("-t", "--track", help="source track index or name (default: busiest)")
+    p.add_argument("--lane-mode", choices=["quantile", "contour", "single"], default="quantile")
+    p.add_argument("--min-gap", type=float, default=0.125,
+                   help="min beats between guitar notes (thins noisy transcriptions)")
+    p.add_argument("--sustains", action="store_true", help="keep long notes as sustains")
+    a = p.parse_args()
+    dest, n = convert(a.input, a.output, a.instrument, a.track, a.lane_mode, a.min_gap, a.sustains)
+    print(f"wrote {dest}: {n} note-ons on {TRACK_NAMES[a.instrument]}")
 
 
 if __name__ == "__main__":
