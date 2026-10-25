@@ -5,4 +5,5 @@ tkinterdnd2
 imageio-ffmpeg
 demucs
 onnxruntime
+yt-dlp
 # torch/torchaudio are installed first, and basic-pitch (model file only) last, by setup.bat

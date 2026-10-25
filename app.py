@@ -5,14 +5,16 @@ import os
 import queue
 import shutil
 import sys
+import tempfile
 import threading
 import traceback
+import webbrowser
 from pathlib import Path
 
 import customtkinter as ctk
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
-from chc import pipeline, tidy
+from chc import pipeline, search, tidy
 
 try:
     import winsound
@@ -43,6 +45,11 @@ def save_config(cfg: dict) -> None:
         pass
 
 
+def short(text: str, n: int = 52) -> str:
+    """Keep long names on one line of the drop box."""
+    return text if len(text) <= n else text[:n - 1].rstrip() + "…"
+
+
 def default_songs_dir() -> Path:
     return Path.home() / "Documents" / "Clone Hero" / "Songs"
 
@@ -59,6 +66,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.cfg = load_config()
         self.songs_dir = Path(self.cfg.get("songs_dir") or default_songs_dir())
         self.src: Path | None = None
+        self.src_url: str | None = None   # a YouTube pick or pasted link, downloaded on "Make my song"
+        self.details = None               # search.Details for song.ini, when known
         self.stop = threading.Event()
         self.result: pipeline.Result | None = None
         self.playing: str | None = None
@@ -110,6 +119,15 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.drop.drop_target_register(DND_FILES)
         self.drop.dnd_bind("<<Drop>>", self.on_drop)
 
+        find = ctk.CTkFrame(f, fg_color="transparent")
+        find.pack(fill="x", pady=(12, 0))
+        self.query = ctk.CTkEntry(find, height=38,
+                                  placeholder_text="...or search for a song (Artist - Title), or paste a YouTube link")
+        self.query.pack(side="left", fill="x", expand=True)
+        self.query.bind("<Return>", lambda e: self.find())
+        ctk.CTkButton(find, text="Search", width=96, height=38, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                      command=self.find).pack(side="left", padx=(10, 0))
+
         form = ctk.CTkFrame(f, fg_color="transparent")
         form.pack(fill="x", pady=(18, 0))
         form.columnconfigure((0, 1), weight=1, uniform="c")
@@ -138,6 +156,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.switch(f)
         if self.src:
             self.set_source(self.src)
+        elif self.src_url:
+            self.set_url(self.src_url, getattr(self, "src_label", "YouTube link"), *self.src_names)
 
     def browse(self):
         from tkinter import filedialog
@@ -156,15 +176,157 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     def set_source(self, path: Path):
         if getattr(self, "working", False) or not hasattr(self, "artist") or not self.artist.winfo_exists():
             return
-        self.src = path
+        self.src, self.src_url, self.details = path, None, None
         artist, title = pipeline.parse_name(path)
         for entry, val in ((self.artist, artist), (self.title_e, title)):
             entry.delete(0, "end")
             entry.insert(0, val)
-        self.drop_title.configure(text=path.name)
+        self.drop_title.configure(text=short(path.name))
         self.drop_sub.configure(text="Ready. Check the names below, then press Make my song.")
         self.drop.configure(border_color=GOOD)
         self.go.configure(state="normal")
+
+    def set_url(self, url: str, label: str, artist: str = "", title: str = ""):
+        """Use a YouTube video as the song: it is downloaded when Make my song is pressed."""
+        if getattr(self, "working", False) or not hasattr(self, "artist") or not self.artist.winfo_exists():
+            return
+        self.src, self.src_url, self.src_label, self.src_names = None, url, label, (artist, title)
+        for entry, val in ((self.artist, artist), (self.title_e, title)):
+            entry.delete(0, "end")
+            entry.insert(0, val)
+        self.drop_title.configure(text=short("YouTube: " + label))
+        self.drop_sub.configure(text="Ready. The audio is downloaded when you press Make my song.")
+        self.drop.configure(border_color=GOOD)
+        self.go.configure(state="normal")
+
+    # ---------- search ----------
+    def find(self):
+        q = self.query.get().strip()
+        if not q:
+            return
+        if search.is_url(q):
+            artist, title = self.artist.get().strip(), self.title_e.get().strip()
+            self.details = None
+            self.set_url(q, q, artist, title)
+
+            def name_it():  # fill the names from the video's title, e.g. "Artist - Song (Official Video)"
+                try:
+                    vt, channel = search.video_title(q)
+                except Exception:
+                    return
+                a, t = search.names_from_video(vt, channel)
+                self.ui(lambda: self.src_url == q and self.set_url(q, vt, artist or a, title or t))
+            threading.Thread(target=name_it, daemon=True).start()
+            return
+        self.show_search(q)
+
+    def show_search(self, q: str):
+        artist, title = search.parse_query(q)
+        f = ctk.CTkFrame(self, fg_color="transparent")
+        self.back_button(f)
+        self.header(f, "Find a song", f"Results for “{q}”")
+        self.search_status = ctk.CTkLabel(f, text="Searching...", text_color=MUTED, anchor="w")
+        self.search_status.pack(fill="x")
+        self.results = ctk.CTkScrollableFrame(f, fg_color="transparent")
+        self.results.pack(fill="both", expand=True, pady=(6, 0))
+        self.switch(f)
+        threading.Thread(target=self.search_work, args=(artist, title), daemon=True).start()
+
+    def search_work(self, artist, title):
+        charts, details, videos, errors = [], None, [], []
+        try:
+            charts = search.community_charts(artist, title)
+        except Exception as e:
+            errors.append(f"chart search ({e.__class__.__name__})")
+        try:
+            details = search.song_details(artist, title)
+        except Exception:
+            details = None  # song details are a bonus; quietly skip
+        if details and not artist:
+            artist = details.artist
+        try:
+            videos = search.youtube_search(artist, title, expect_seconds=details.seconds if details else 0)
+        except Exception as e:
+            errors.append(f"YouTube search ({e.__class__.__name__}; try Settings → Update downloader)")
+        self.ui(self.show_results, artist, title, charts, details, videos, errors)
+
+    def section(self, text, sub=""):
+        ctk.CTkLabel(self.results, text=text, font=ctk.CTkFont(size=16, weight="bold"), anchor="w"
+                     ).pack(fill="x", pady=(14, 0))
+        if sub:
+            ctk.CTkLabel(self.results, text=sub, text_color=MUTED, anchor="w", wraplength=700,
+                         justify="left").pack(fill="x", pady=(0, 4))
+
+    def result_row(self, line1, line2, button, command, badge=""):
+        row = ctk.CTkFrame(self.results, fg_color=CARD, corner_radius=12)
+        row.pack(fill="x", pady=3)
+        txt = ctk.CTkFrame(row, fg_color="transparent")
+        txt.pack(side="left", fill="x", expand=True, padx=14, pady=8)
+        top = ctk.CTkFrame(txt, fg_color="transparent")
+        top.pack(fill="x")
+        ctk.CTkLabel(top, text=line1, anchor="w", font=ctk.CTkFont(size=14), wraplength=520,
+                     justify="left").pack(side="left")
+        if badge:
+            ctk.CTkLabel(top, text=f"  {badge}", text_color=GOOD, font=ctk.CTkFont(size=13, weight="bold")
+                         ).pack(side="left")
+        ctk.CTkLabel(txt, text=line2, anchor="w", text_color=MUTED).pack(fill="x")
+        b = ctk.CTkButton(row, text=button, width=130, fg_color=ACCENT, hover_color=ACCENT_HOVER)
+        b.configure(command=lambda: command(b))
+        b.pack(side="right", padx=12)
+        return b
+
+    def show_results(self, artist, title, charts, details, videos, errors):
+        if not getattr(self, "results", None) or not self.results.winfo_exists():
+            return  # the user went back
+        status = []
+        if details:
+            bits = [x for x in (details.album, details.year, details.genre) if x]
+            status.append(f"{details.artist} – {details.title}" + (f"   ({', '.join(bits)})" if bits else ""))
+        if errors:
+            status.append("Could not finish: " + "; ".join(errors))
+        self.search_status.configure(text="\n".join(status) or "Done.",
+                                     text_color="#e0a23a" if errors else MUTED)
+        self.section("Already charted by the community",
+                     "Real charts made by people on Chorus (enchor.us). If one is here, it will play "
+                     "better than a generated chart." if charts else
+                     "No existing chart found, so making one below is the way to go.")
+        for c in charts:
+            line2 = f"charted by {c.charter}" + (f"   ·   {c.parts}" if c.parts else "")
+            self.result_row(f"{c.artist} – {c.name}", line2, "Download chart",
+                            lambda b, c=c: self.get_chart(b, c))
+        self.section("Make a chart from YouTube",
+                     "Pick the version to chart. The plain album recording works best; "
+                     "“Topic” uploads usually are exactly that.")
+        if not videos:
+            ctk.CTkLabel(self.results, text="No videos found.", text_color=MUTED, anchor="w").pack(fill="x")
+        for v in videos:
+            mins = f"{int(v.seconds // 60)}:{int(v.seconds % 60):02d}" if v.seconds else "?"
+            self.result_row(v.title, f"{v.channel}   ·   {mins}", "Use this",
+                            lambda b, v=v: self.use_video(v, artist, title, details),
+                            badge="Best match" if v.best else "")
+
+    def get_chart(self, button, chart):
+        button.configure(text="Downloading...", state="disabled")
+
+        def run():
+            try:
+                path = search.download_chart(chart, self.songs_dir)
+                self.ui(lambda: (button.configure(text="Saved ✓"),
+                                 self.search_status.configure(
+                                     text=f"Saved {path.name} to your songs folder. Rescan songs in "
+                                          "Clone Hero to see it.", text_color=GOOD)))
+            except Exception as e:
+                self.ui(lambda: (button.configure(text="Download chart", state="normal"),
+                                 self.search_status.configure(text=f"Download failed: {e}",
+                                                              text_color="#e0a23a")))
+        threading.Thread(target=run, daemon=True).start()
+
+    def use_video(self, video, artist, title, details):
+        self.details = details
+        artist = (details.artist if details else "") or artist
+        title = (details.title if details else "") or title
+        self.show_home()
+        self.set_url(video.url, f"{video.title} ({video.channel})", artist, title)
 
     def pick_folder(self):
         from tkinter import filedialog
@@ -183,7 +345,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                       command=command or self.show_home).pack(anchor="w", pady=(0, 10))
 
     def show_settings(self):
-        f = ctk.CTkFrame(self, fg_color="transparent")
+        f = ctk.CTkScrollableFrame(self, fg_color="transparent")  # more cards than fit the window
         self.back_button(f)
         self.header(f, "Settings")
 
@@ -237,6 +399,31 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         ctk.CTkButton(card3, text="Scan songs folder...", height=38, fg_color=ACCENT,
                       hover_color=ACCENT_HOVER, command=lambda: (save_charter(), self.show_tidy())
                       ).pack(anchor="w", padx=16, pady=(8, 14))
+
+        card4 = ctk.CTkFrame(f, fg_color=CARD, corner_radius=14)
+        card4.pack(fill="x", pady=(12, 0))
+        ctk.CTkLabel(card4, text="YouTube downloader", font=ctk.CTkFont(size=15, weight="bold")).pack(
+            anchor="w", padx=16, pady=(12, 0))
+        ctk.CTkLabel(card4, text="YouTube changes often and older downloader versions stop working. "
+                                 "If searching or downloading fails, update it here.",
+                     text_color=MUTED, wraplength=680, justify="left").pack(anchor="w", padx=16)
+        row4 = ctk.CTkFrame(card4, fg_color="transparent")
+        row4.pack(fill="x", padx=16, pady=(8, 14))
+        upd_msg = ctk.CTkLabel(row4, text="", text_color=MUTED, anchor="w")
+
+        def update():
+            upd.configure(state="disabled", text="Updating...")
+
+            def run():
+                msg = search.update_downloader()
+                self.ui(lambda: upd_msg.winfo_exists() and (
+                    upd.configure(state="normal", text="Update downloader"),
+                    upd_msg.configure(text=msg, text_color=GOOD if "up to date" in msg else "#e0a23a")))
+            threading.Thread(target=run, daemon=True).start()
+        upd = ctk.CTkButton(row4, text="Update downloader", height=38, fg_color=ACCENT,
+                            hover_color=ACCENT_HOVER, command=update)
+        upd.pack(side="left")
+        upd_msg.pack(side="left", padx=12, fill="x", expand=True)
         self.switch(f)
 
     # ---------- tidy names ----------
@@ -315,20 +502,23 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
     # ---------- progress ----------
     def start(self):
-        if not self.src:
+        if not (self.src or self.src_url):
             return
         self.cfg["songs_dir"] = str(self.songs_dir)
         save_config(self.cfg)
-        artist, title = self.artist.get().strip(), self.title_e.get().strip() or self.src.stem
+        fallback = self.src.stem if self.src else "Untitled"
+        artist, title = self.artist.get().strip(), self.title_e.get().strip() or fallback
         self.working = True
         self.stop.clear()
+        # a YouTube source gets an extra first step; the pipeline's steps follow it
+        self.steps = (["Downloading the song"] if self.src_url else []) + pipeline.STEPS
 
         f = ctk.CTkFrame(self, fg_color="transparent")
         self.header(f, "Making your song", f"{artist + ' - ' if artist else ''}{title}")
         card = ctk.CTkFrame(f, fg_color=CARD, corner_radius=18)
         card.pack(fill="x")
         self.step_lbls = []
-        for s in pipeline.STEPS:
+        for s in self.steps:
             lbl = ctk.CTkLabel(card, text=f"○  {s}", anchor="w", font=ctk.CTkFont(size=16),
                                text_color=MUTED)
             lbl.pack(fill="x", padx=24, pady=(14 if not self.step_lbls else 6, 0))
@@ -343,7 +533,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                       text_color=("#222", "#eee"), command=self.cancel).pack(pady=18)
         self.switch(f)
 
-        threading.Thread(target=self.work, args=(self.src, artist, title), daemon=True).start()
+        threading.Thread(target=self.work, args=(self.src, self.src_url, artist, title, self.details),
+                         daemon=True).start()
 
     def cancel(self):
         self.stop.set()
@@ -364,7 +555,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
     def set_step(self, i):
         for n, lbl in enumerate(self.step_lbls):
-            name = pipeline.STEPS[n]
+            name = self.steps[n]
             if n < i:
                 lbl.configure(text=f"✓  {name}", text_color=GOOD)
             elif n == i:
@@ -376,20 +567,43 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.bar.set(frac)
         self.pct.configure(text=f"{int(frac * 100)}%")
 
-    def work(self, src, artist, title):
+    def work(self, src, url, artist, title, details):
+        tmp = Path(tempfile.mkdtemp(prefix="chc_get_"))
         try:
+            offset, start = 0, 0.0
+            if url:
+                self.ui(self.set_step, 0)
+                src = search.youtube_download(url, tmp, lambda fr: self.ui(self.set_progress, 0.12 * fr), self.stop)
+                offset, start = 1, 0.12
+            # album, year, genre and cover for song.ini / album.jpg; skipped quietly when offline
+            cover = None
+            try:
+                details = details or search.song_details(artist, title)
+                cover = search.cover_art(details, tmp / "cover.jpg") if details else None
+            except Exception:
+                details = None
             res = pipeline.make_song(
                 src, artist, title, self.songs_dir, charter=self.cfg.get("charter", ""),
-                on_step=lambda i: self.ui(self.set_step, i),
-                on_progress=lambda fr: self.ui(self.set_progress, fr), stop=self.stop)
+                on_step=lambda i: self.ui(self.set_step, i + offset),
+                on_progress=lambda fr: self.ui(self.set_progress, start + (1 - start) * fr), stop=self.stop,
+                details=details, cover=cover)
             self.ui(self.show_result, res)
         except pipeline.Cancelled:
             self.ui(self.finish_busy)
             self.ui(self.show_home)
         except Exception as e:
+            if self.stop.is_set():  # cancelled during the download
+                self.ui(self.finish_busy)
+                self.ui(self.show_home)
+                return
             traceback.print_exc()
             self.ui(self.finish_busy)
-            self.ui(self.show_error, str(e))
+            msg = str(e)
+            if url and "youtube" in traceback.format_exc().lower():
+                msg += "\n\nIf YouTube downloads keep failing, try Settings → Update downloader."
+            self.ui(self.show_error, msg)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def finish_busy(self):
         self.working = False
@@ -448,7 +662,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     def another(self):
         self.stop_audio()
         self.cleanup_preview()
-        self.src = None
+        self.src, self.src_url, self.details = None, None, None
         self.show_home()
 
     # ---------- audio preview ----------

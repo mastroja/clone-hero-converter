@@ -59,8 +59,10 @@ def _separate(wav: Path, out: Path, model: str, on_progress, stop: threading.Eve
 
 def make_song(src: Path, artist: str, title: str, songs_dir: Path, charter: str = "",
               model: str = "htdemucs_ft", on_step=lambda i: None,
-              on_progress=lambda frac: None, stop: threading.Event | None = None) -> Result:
-    """Run everything. on_step(i) marks STEPS[i] as started; on_progress is 0..1 overall."""
+              on_progress=lambda frac: None, stop: threading.Event | None = None,
+              details=None, cover: Path | None = None) -> Result:
+    """Run everything. on_step(i) marks STEPS[i] as started; on_progress is 0..1 overall.
+    details (search.Details) fills album/genre/year in song.ini; cover becomes album.jpg."""
     stop = stop or threading.Event()
 
     def check():
@@ -147,8 +149,12 @@ def make_song(src: Path, artist: str, title: str, songs_dir: Path, charter: str 
         counts = chart.write_mid(song_dir / "notes.mid", bpm, offset,
                                  guitar=gtimed, bass=btimed, drums=drum_timed, snap=snap,
                                  beatmap=beatmap)
+        d = details
         chart.write_ini(song_dir / "song.ini", title, artist, charter, int(length * 1000), counts,
-                        preview_ms=int(min(30, max(0, length - 40)) * 1000))
+                        preview_ms=int(min(30, max(0, length - 40)) * 1000),
+                        album=d.album if d else "", genre=d.genre if d else "", year=d.year if d else "")
+        if cover is not None and Path(cover).exists():
+            shutil.copy(cover, song_dir / "album.jpg")
         for demucs_name, ch_name in STEM_TO_CH.items():
             audio.to_ogg(preview_dir / f"{demucs_name}.wav", song_dir / f"{ch_name}.ogg")
             check()

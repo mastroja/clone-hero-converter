@@ -345,8 +345,9 @@ def write_mid(path: Path, bpm: float, offset: float, guitar=None, bass=None, dru
 
 
 def write_ini(path: Path, title: str, artist: str, charter: str, length_ms: int,
-              parts: dict, preview_ms: int = 0):
-    lines = ["[song]", f"name = {title}", f"artist = {artist}", "album =", "genre =", "year =",
+              parts: dict, preview_ms: int = 0, album: str = "", genre: str = "", year: str = ""):
+    lines = ["[song]", f"name = {title}", f"artist = {artist}", f"album = {album}",
+             f"genre = {genre}", f"year = {year}",
              f"charter = {charter}", f"diff_guitar = {2 if 'PART GUITAR' in parts else -1}",
              f"diff_bass = {2 if 'PART BASS' in parts else -1}",
              f"diff_drums = {2 if 'PART DRUMS' in parts else -1}",
