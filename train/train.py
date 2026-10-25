@@ -159,6 +159,8 @@ def main():
     ap.add_argument("--data", choices=["v2", "v3"], default="v2")
     ap.add_argument("--dm-src", choices=["ft", "s6"], default="ft")
     ap.add_argument("--rel", action="store_true", help="also learn up/same/down fret moves")
+    ap.add_argument("--save-every", type=int, default=1000,
+                    help="steps between resumable snapshots (also taken when paused)")
     args = ap.parse_args()
     global WIN
     WIN = args.win
@@ -201,13 +203,33 @@ def main():
         pw[n_l + 2:] = 3.0
     lossf = tnn.BCEWithLogitsLoss(pos_weight=pw)
     t0 = time.time()
-    run, best_f = 0.0, -1.0
+    run, best_f, start = 0.0, -1.0, 1
 
     def save(thr):
         torch.save({"state": model.state_dict(), "kind": args.kind, "thr": thr, "hidden": args.hidden,
                     "n_out": n_out, "data": args.data, "dm_src": args.dm_src, "rel": args.rel}, out)
 
-    for step in range(1, args.steps + 1):
+    # resumable snapshot: everything needed to carry on exactly where training stopped
+    snap = out.with_name(out.stem + ".resume.pt")
+
+    def snapshot(step):
+        tmp = snap.with_name(snap.stem + ".part.pt")
+        torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(),
+                    "step": step, "rng": rng.bit_generator.state, "run": run, "best_f": best_f,
+                    "steps": args.steps}, tmp)
+        tmp.replace(snap)
+
+    if snap.exists():
+        st = torch.load(snap, map_location=device, weights_only=False)
+        if st["steps"] == args.steps:
+            model.load_state_dict(st["model"])
+            opt.load_state_dict(st["opt"])
+            sched.load_state_dict(st["sched"])
+            rng.bit_generator.state = st["rng"]
+            run, best_f, start = st["run"], st["best_f"], st["step"] + 1
+            print(f"resuming at step {start}", flush=True)
+
+    for step in range(start, args.steps + 1):
         model.train()
         xs, ys = zip(*(banks[rng.choice(len(banks), p=weights)].window(rng) for _ in range(args.batch)))
         x = torch.from_numpy(np.stack(xs)).to(device)
@@ -234,6 +256,12 @@ def main():
             if f > best_f:  # keep the best checkpoint, not just the last
                 best_f = f
                 save(thr)
+        if step < args.steps and (step % args.save_every == 0 or (step % 100 == 0 and data.paused())):
+            snapshot(step)
+            if data.paused():
+                print(f"paused at step {step}", flush=True)
+                raise SystemExit(3)
+    snap.unlink(missing_ok=True)
     print(f"FINAL best val lane-aware F1 {best_f:.3f} -> {out}", flush=True)
 
 

@@ -53,6 +53,9 @@ def main():
     for n, s in enumerate(order):
         if limit and done >= limit:
             break
+        if data.paused():
+            print("paused", flush=True)
+            sys.exit(3)
         out = data.V3 / "stems" / data.song_id(s)
         if all((out / f"{f}.flac").exists() for f in KEEP.values()):
             continue

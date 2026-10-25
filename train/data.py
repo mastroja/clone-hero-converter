@@ -29,6 +29,19 @@ def song_id(song: dict) -> str:
 
 
 V3 = Path("data/v3")
+PAUSE = V3 / "PAUSE"  # while this file exists, long runs stop at the next safe point
+
+
+def paused() -> bool:
+    return PAUSE.exists()
+
+
+def save_npy(path: Path, arr) -> None:
+    """np.save under a temporary name, then rename, so an interrupted save never leaves a
+    truncated file that would later be taken as finished."""
+    tmp = path.with_name(path.stem + ".part.npy")
+    np.save(tmp, arr)
+    tmp.replace(path)
 
 
 class Layout:

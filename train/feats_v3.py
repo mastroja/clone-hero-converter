@@ -57,9 +57,12 @@ def main():
                 if len(wave) < features.SR:
                     continue
                 for dest, kind in outs:
-                    np.save(dest, features.compute(wave, kind, DEVICE))
+                    data.save_npy(dest, features.compute(wave, kind, DEVICE))
                     done += 1
             print(done, "feature files", flush=True)
+            if data.paused():
+                print("paused", flush=True)
+                sys.exit(3)
     print("done", done)
 
 
