@@ -35,10 +35,13 @@ def n_lanes(kind: str) -> int:
 
 
 class NoteNet(nn.Module):
-    def __init__(self, kind: str, hidden: int = 128, n_out: int | None = None):
+    def __init__(self, kind: str, hidden: int = 128, n_out: int | None = None, context: bool = False):
+        """context: also take the whole song's feature profile (features.song_profile) next to
+        every window, so the model knows where the music sits in the song's range."""
         super().__init__()
         self.kind = kind
         self.n_out = n_out or len(CHANNELS[kind])
+        self.context = context
         n_bins = features.n_bins(kind)
         ch = [1, 16, 32, 48]
         pools = [3, 3, 2]
@@ -50,13 +53,20 @@ class NoteNet(nn.Module):
             f //= pools[i]
         self.conv = nn.Sequential(*layers)
         self.proj = nn.Sequential(nn.Linear(ch[-1] * f, 256), nn.ReLU(), nn.Dropout(0.2))
-        self.rnn = nn.GRU(256, hidden, num_layers=2, batch_first=True, bidirectional=True, dropout=0.2)
-        self.out = nn.Linear(2 * hidden + 256, self.n_out)
+        width = 256
+        if context:
+            self.ctx = nn.Sequential(nn.Linear(2 * n_bins, 64), nn.ReLU())
+            width += 64
+        self.rnn = nn.GRU(width, hidden, num_layers=2, batch_first=True, bidirectional=True, dropout=0.2)
+        self.out = nn.Linear(2 * hidden + width, self.n_out)
 
-    def forward(self, x):  # x: (B, T, F) normalised features
+    def forward(self, x, profile=None):  # x: (B, T, F) normalised features; profile: (B, 2F)
         h = self.conv(x.unsqueeze(1))                      # (B, C, T, F')
         h = h.permute(0, 2, 1, 3).flatten(2)               # (B, T, C*F')
         h = self.proj(h)                                   # full time resolution
+        if self.context:
+            c = self.ctx(profile)[:, None, :].expand(-1, h.shape[1], -1)
+            h = torch.cat([h, c], dim=-1)
         T = h.shape[1]
         pad = (-T) % DOWN
         hp = nn.functional.pad(h, (0, 0, 0, pad))
@@ -70,13 +80,15 @@ class NoteNet(nn.Module):
 def predict(model: NoteNet, feats: np.ndarray, device="cuda", chunk=4096, pad=256) -> np.ndarray:
     """Probabilities (T, n_out) for a whole song, processed in overlapping chunks."""
     model.eval()
-    x = torch.from_numpy(features.normalize(feats)).to(device)
+    xn = features.normalize(feats)
+    x = torch.from_numpy(xn).to(device)
+    prof = torch.from_numpy(features.song_profile(xn))[None].to(device) if model.context else None
     T = x.shape[0]
     out = np.zeros((T, model.n_out), np.float32)
     start = 0
     while start < T:
         a, b = max(0, start - pad), min(T, start + chunk + pad)
-        p = torch.sigmoid(model(x[a:b][None]))[0].cpu().numpy()
+        p = torch.sigmoid(model(x[a:b][None], prof))[0].cpu().numpy()
         out[start:min(T, start + chunk)] = p[start - a: start - a + min(chunk, T - start)]
         start += chunk
     return out

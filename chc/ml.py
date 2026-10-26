@@ -24,7 +24,7 @@ def load(kind: str, device="cuda"):
         if fkind not in features.KINDS or nn.instrument(fkind) != nn.instrument(kind):
             fkind = kind
         n_out = ck.get("n_out") or ck["state"]["out.weight"].shape[0]  # older models have 5 outputs
-        m = nn.NoteNet(fkind, ck.get("hidden", 128), n_out).to(device)
+        m = nn.NoteNet(fkind, ck.get("hidden", 128), n_out, ck.get("context", False)).to(device)
         m.load_state_dict(ck["state"])
         m.eval()
         _cache[kind] = (m, ck.get("thr", 0.4))

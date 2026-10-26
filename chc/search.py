@@ -167,7 +167,13 @@ def song_details(artist: str, title: str) -> Details | None:
     base = f'recording:"{title}"' + (f' AND artist:"{artist}"' if artist else "")
     recs = []
     # official albums first (the original studio recording is usually among them), then anything
-    for q in (base + " AND status:official AND primarytype:album", base):
+    # studio albums first (no compilations, live albums, soundtracks...: classics have hundreds of
+    # recordings and the original can otherwise fall outside the results), then official
+    # albums, then anything
+    studio = (" AND status:official AND primarytype:album AND NOT secondarytype:compilation"
+              " AND NOT secondarytype:live AND NOT secondarytype:soundtrack AND NOT secondarytype:remix"
+              " AND NOT secondarytype:demo")
+    for q in (base + studio, base + " AND status:official AND primarytype:album", base):
         recs = _mb("recording", query=q, limit=50).get("recordings") or []
         if recs:
             break
@@ -196,9 +202,12 @@ def song_details(artist: str, title: str) -> Details | None:
                 (rel.get("date") or "")[:4], "", (r.get("length") or 0) / 1000.0, rg.get("id", ""))
     try:
         if d.release_group:
-            g = _mb(f"release-group/{d.release_group}", inc="genres").get("genres") or []
+            rg = _mb(f"release-group/{d.release_group}", inc="genres")
+            g = rg.get("genres") or []
             if g:
                 d.genre = max(g, key=lambda x: x.get("count", 0))["name"].title()
+            if rg.get("first-release-date"):
+                d.year = rg["first-release-date"][:4]  # the album's original year, not a reissue's
     except Exception:
         pass
     return d

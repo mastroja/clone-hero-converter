@@ -69,6 +69,14 @@ def compute(wave: np.ndarray, kind: str, device="cuda") -> np.ndarray:
     return out.half().cpu().numpy()
 
 
+def song_profile(f: np.ndarray) -> np.ndarray:
+    """Whole-song summary of normalised features: each bin's average and 90th-percentile level.
+    For pitch-sharp features this says which notes the song uses, i.e. its pitch range, which
+    charters spread over the five frets (models see only ~12 s of audio at a time otherwise)."""
+    f = np.asarray(f[:: max(1, len(f) // 4000)], dtype=np.float32)
+    return np.concatenate([f.mean(0), np.percentile(f, 90, axis=0)]).astype(np.float32)
+
+
 def normalize(f: np.ndarray) -> np.ndarray:
     """Per-song standardisation so quiet and loud mixes look alike."""
     f = f.astype(np.float32)
