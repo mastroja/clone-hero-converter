@@ -385,5 +385,6 @@ def write_ini(path: Path, title: str, artist: str, charter: str, length_ms: int,
              f"diff_bass = {diff('bass')}",
              f"diff_drums = {diff('drums')}",
              "pro_drums = True", f"song_length = {length_ms}", "delay = 0",
-             f"preview_start_time = {preview_ms}"]
+             f"preview_start_time = {preview_ms}",
+             "chc_generated = 1"]  # marks songs this app made (chc.library.is_ours)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

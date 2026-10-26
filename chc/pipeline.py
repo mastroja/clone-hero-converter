@@ -8,6 +8,8 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
+
 from . import analysis, audio, chart, ml, rating, structure
 
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -29,6 +31,7 @@ class Result:
     counts: dict = field(default_factory=dict)  # part -> expert note count
     bpm: float = 0.0
     seconds: float = 0.0
+    replaced: list = field(default_factory=list)  # backups of earlier versions it replaced
 
 
 def parse_name(path: Path) -> tuple[str, str]:
@@ -55,6 +58,132 @@ def _separate(wav: Path, out: Path, model: str, on_progress, stop: threading.Eve
             tail.append(line.rstrip())
     if proc.wait() != 0:
         raise RuntimeError("Splitting failed:\n" + "\n".join(tail[-6:]))
+
+
+def chart_stems(guitar_wav: Path, bass_wav: Path, drums_wav: Path, mix_wav: Path,
+                progress=lambda f: None, check=lambda: None, notes_started=lambda: None) -> dict:
+    """Separated stems (wav) and the full mix -> the chart's notes per part plus its tempo map.
+    Shared by making a new song and updating an existing song's chart from its own stems."""
+    drums_x, sr = audio.read_wav(drums_wav)
+    beatmap = None
+    if ml.available("mix"):
+        mix_x, mix_sr = audio.read_wav(mix_wav)
+        b, d = ml.beat_times(mix_x, mix_sr)
+        if len(b) >= 16:
+            beatmap = chart.BeatMap(b, d)
+    heur_drums, env = analysis.drum_hits(drums_x, sr)
+    bpm, offset = analysis.estimate_tempo(env, sr)
+    if beatmap is not None:
+        bpm = beatmap.bpm
+    check()
+    progress(0.35)
+    notes_started()
+    other_x, _ = audio.read_wav(guitar_wav)
+    bass_x, _ = audio.read_wav(bass_wav)
+    feats = {}  # model input features per part, for finding repeated sections
+    if ml.available("drums"):
+        drum_timed, feats["drums"] = ml.drum_notes(drums_x, sr, with_features=True)
+    else:
+        lane_of = {"K": 0, "S": 1, "H": 2, "C": 4}
+        drum_timed = [(t, lane_of[c], False) for t, c in heur_drums]
+    check()
+    progress(0.6)
+    if ml.available("guitar"):
+        gtimed, feats["guitar"] = ml.fretted_notes("guitar", other_x, sr, with_features=True)
+    else:
+        att = analysis.guitar_attacks(other_x, sr)
+        gt_ = [t for t, _ in att]
+        gtimed = list(zip(gt_, analysis.local_lanes([h for _, h in att], gt_)))
+    check()
+    progress(0.8)
+    if ml.available("bass"):
+        btimed, feats["bass"] = ml.fretted_notes("bass", bass_x, sr, with_features=True)
+    else:
+        bp = analysis.pitched_notes(bass_x, sr, 35, 300, sensitivity=1.1, min_gap=0.12)
+        bt_ = [t for t, _ in bp]
+        btimed = list(zip(bt_, analysis.local_lanes([p for _, p in bp], bt_)))
+    if beatmap is not None:
+        # every note on its bar's grid, and repeated sections charted the same way
+        snap = True
+        parts = {"guitar": gtimed, "bass": btimed, "drums": drum_timed}
+        for k, f in feats.items():
+            parts[k] = structure.make_consistent(k, parts[k], f, beatmap)
+        gtimed, btimed, drum_timed = parts["guitar"], parts["bass"], parts["drums"]
+    else:
+        # No tracked beats: only snap to a fixed grid when the song really sits on one;
+        # live or loose recordings are charted at their exact audio times instead.
+        fit = chart.grid_fit([g[0] for g in gtimed] + [d[0] for d in drum_timed], bpm, offset)
+        snap = fit < 0.15
+    progress(1.0)
+    return {"guitar": gtimed, "bass": btimed, "drums": drum_timed, "beatmap": beatmap,
+            "bpm": bpm, "offset": offset, "snap": snap}
+
+
+def write_chart(song_dir: Path, c: dict, title: str, artist: str, charter: str, length: float,
+                details=None, preview_ms: int | None = None) -> dict:
+    """notes.mid and song.ini (with difficulty ratings and song details) for chart_stems' result."""
+    counts = chart.write_mid(song_dir / "notes.mid", c["bpm"], c["offset"], guitar=c["guitar"],
+                             bass=c["bass"], drums=c["drums"], snap=c["snap"], beatmap=c["beatmap"])
+    d = details
+    # each instrument's difficulty tier for the song list, judged from its Expert chart
+    tiers = {k: rating.tier(k, c[k]) for k in ("guitar", "bass", "drums") if c[k]}
+    if preview_ms is None:
+        preview_ms = int(min(30, max(0, length - 40)) * 1000)
+    chart.write_ini(song_dir / "song.ini", title, artist, charter, int(length * 1000), counts,
+                    preview_ms=preview_ms, album=d.album if d else "", genre=d.genre if d else "",
+                    year=d.year if d else "", tiers=tiers)
+    return counts
+
+
+UPDATE_STEPS = ["Reading the song's audio", "Finding the beat", "Writing the new notes"]
+
+
+def update_song(song_dir: Path, on_step=lambda i: None, on_progress=lambda frac: None,
+                stop: threading.Event | None = None) -> Path:
+    """Re-chart a song this app made, from the stems already in its folder (no separation, no
+    original audio needed). The old notes.mid and song.ini are backed up first; audio, cover,
+    name and song details are kept. Returns the backup folder."""
+    from . import library
+    from .search import Details
+    stop = stop or threading.Event()
+
+    def check():
+        if stop.is_set():
+            raise Cancelled()
+    if not library.is_ours(song_dir):
+        raise ValueError(f"{song_dir.name} was not made by this app, so it is left alone")
+    ini = library.tidy.read_ini(song_dir)
+    work = Path(tempfile.mkdtemp(prefix="chc_update_"))
+    try:
+        on_step(0)
+        on_progress(0.02)
+        wavs = {n: audio.to_wav(song_dir / f"{n}.ogg", work / f"{n}.wav")
+                for n in ("guitar", "bass", "drums", "vocals")}
+        # the four stems add back up to the whole song, for finding the beat
+        waves = [audio.read_wav(w) for w in wavs.values()]
+        n = max(x.shape[-1] for x, _ in waves)
+        mix = sum(np.pad(x, [(0, 0)] * (x.ndim - 1) + [(0, n - x.shape[-1])]) for x, _ in waves)
+        audio.write_wav(work / "mix.wav", mix[None], waves[0][1])
+        length = audio.duration(work / "mix.wav")
+        check()
+        on_step(1)
+        on_progress(0.15)
+        c = chart_stems(wavs["guitar"], wavs["bass"], wavs["drums"], work / "mix.wav",
+                        lambda f: on_progress(0.15 + 0.8 * f), check, lambda: on_step(2))
+        check()
+        saved = library.backup(song_dir, "before chart update", files=["notes.mid", "song.ini"])
+        d = Details(ini.get("name", ""), ini.get("artist", ""), ini.get("album", ""),
+                    ini.get("year", ""), ini.get("genre", ""))
+        try:
+            preview = int(float(ini.get("preview_start_time", "")))
+        except ValueError:
+            preview = None
+        write_chart(song_dir, c, ini.get("name", song_dir.name), ini.get("artist", ""),
+                    ini.get("charter", ""), length, d, preview)
+        on_progress(1.0)
+        return saved
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def make_song(src: Path, artist: str, title: str, songs_dir: Path, charter: str = "",
@@ -92,71 +221,17 @@ def make_song(src: Path, artist: str, title: str, songs_dir: Path, charter: str 
             check()
 
         on_step(2); on_progress(0.72)
-        drums_x, sr = audio.read_wav(preview_dir / "drums.wav")
-        beatmap = None
-        if ml.available("mix"):
-            mix_x, mix_sr = audio.read_wav(wav)
-            b, d = ml.beat_times(mix_x, mix_sr)
-            if len(b) >= 16:
-                beatmap = chart.BeatMap(b, d)
-        heur_drums, env = analysis.drum_hits(drums_x, sr)
-        bpm, offset = analysis.estimate_tempo(env, sr)
-        if beatmap is not None:
-            bpm = beatmap.bpm
-        check()
-
-        on_step(3); on_progress(0.80)
-        other_x, _ = audio.read_wav(guitar_wav)
-        bass_x, _ = audio.read_wav(preview_dir / "bass.wav")
-        feats = {}  # model input features per part, for finding repeated sections
-        if ml.available("drums"):
-            drum_timed, feats["drums"] = ml.drum_notes(drums_x, sr, with_features=True)
-        else:
-            lane_of = {"K": 0, "S": 1, "H": 2, "C": 4}
-            drum_timed = [(t, lane_of[c], False) for t, c in heur_drums]
-        check()
-        on_progress(0.86)
-        if ml.available("guitar"):
-            gtimed, feats["guitar"] = ml.fretted_notes("guitar", other_x, sr, with_features=True)
-        else:
-            att = analysis.guitar_attacks(other_x, sr)
-            gt_ = [t for t, _ in att]
-            gtimed = list(zip(gt_, analysis.local_lanes([h for _, h in att], gt_)))
-        check()
-        on_progress(0.90)
-        if ml.available("bass"):
-            btimed, feats["bass"] = ml.fretted_notes("bass", bass_x, sr, with_features=True)
-        else:
-            bp = analysis.pitched_notes(bass_x, sr, 35, 300, sensitivity=1.1, min_gap=0.12)
-            bt_ = [t for t, _ in bp]
-            btimed = list(zip(bt_, analysis.local_lanes([p for _, p in bp], bt_)))
-        if beatmap is not None:
-            # every note on its bar's grid, and repeated sections charted the same way
-            snap = True
-            parts = {"guitar": gtimed, "bass": btimed, "drums": drum_timed}
-            for k, f in feats.items():
-                parts[k] = structure.make_consistent(k, parts[k], f, beatmap)
-            gtimed, btimed, drum_timed = parts["guitar"], parts["bass"], parts["drums"]
-        else:
-            # No tracked beats: only snap to a fixed grid when the song really sits on one;
-            # live or loose recordings are charted at their exact audio times instead.
-            fit = chart.grid_fit([g[0] for g in gtimed] + [d[0] for d in drum_timed], bpm, offset)
-            snap = fit < 0.15
+        c = chart_stems(guitar_wav, preview_dir / "bass.wav", preview_dir / "drums.wav", wav,
+                        lambda f: on_progress(0.72 + 0.21 * f), check, lambda: on_step(3))
         check()
 
         on_step(4); on_progress(0.93)
+        # earlier versions this app made of the same song (same or older name) go to backups
+        from . import library
+        replaced = library.prepare_target(songs_dir, artist, title, name)
         song_dir.mkdir(parents=True, exist_ok=True)
-        counts = chart.write_mid(song_dir / "notes.mid", bpm, offset,
-                                 guitar=gtimed, bass=btimed, drums=drum_timed, snap=snap,
-                                 beatmap=beatmap)
-        d = details
-        # each instrument's difficulty tier for the song list, judged from its Expert chart
-        tiers = {k: rating.tier(k, notes) for k, notes in
-                 (("guitar", gtimed), ("bass", btimed), ("drums", drum_timed)) if notes}
-        chart.write_ini(song_dir / "song.ini", title, artist, charter, int(length * 1000), counts,
-                        preview_ms=int(min(30, max(0, length - 40)) * 1000),
-                        album=d.album if d else "", genre=d.genre if d else "", year=d.year if d else "",
-                        tiers=tiers)
+        counts = write_chart(song_dir, c, title, artist, charter, length, details)
+        bpm = c["bpm"]
         if cover is not None and Path(cover).exists():
             shutil.copy(cover, song_dir / "album.jpg")
         for demucs_name, ch_name in STEM_TO_CH.items():
@@ -166,7 +241,7 @@ def make_song(src: Path, artist: str, title: str, songs_dir: Path, charter: str 
         stems = {"Guitar & everything else": preview_dir / "other.wav",
                  "Bass": preview_dir / "bass.wav", "Drums": preview_dir / "drums.wav",
                  "Vocals": preview_dir / "vocals.wav"}
-        return Result(song_dir, preview_dir, stems, counts, bpm, length)
+        return Result(song_dir, preview_dir, stems, counts, bpm, length, replaced)
     except BaseException:
         shutil.rmtree(preview_dir, ignore_errors=True)
         raise

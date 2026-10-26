@@ -34,8 +34,17 @@ def main():
     groups = defaultdict(list)
     for s in index:
         groups[key(s["name"])].append(s)
-    pairs = [g[:2] for g in groups.values() if len(g) >= 2]
-    print(f"{len(pairs)} songs charted twice")
+    import hashlib
+    from pathlib import Path
+
+    def chart_hash(s):
+        f = Path(s["folder"]) / "notes.mid"
+        return hashlib.md5(f.read_bytes()).hexdigest() if f.exists() else s["folder"]
+    all_pairs = [g[:2] for g in groups.values() if len(g) >= 2]
+    # the same chart file under two folder names is a leftover copy, not a second charter
+    pairs = [p for p in all_pairs if chart_hash(p[0]) != chart_hash(p[1])]
+    print(f"{len(all_pairs)} songs charted twice; {len(all_pairs) - len(pairs)} of those are identical copies, "
+          f"leaving {len(pairs)} with two different charts")
     for inst in ("guitar", "bass", "drums"):
         rows, n = [], 0
         for a, b in pairs:

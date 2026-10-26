@@ -7,6 +7,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import webbrowser
 from pathlib import Path
@@ -14,7 +15,7 @@ from pathlib import Path
 import customtkinter as ctk
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
-from chc import pipeline, search, tidy
+from chc import library, pipeline, search, tidy
 
 try:
     import winsound
@@ -120,6 +121,9 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         ctk.CTkButton(f, text="Convert a folder...", width=150, height=32, fg_color=CARD,
                       hover_color=CARD_HOVER, text_color=("#222", "#eee"),
                       command=self.pick_batch_folder).place(relx=1.0, x=-120, y=4, anchor="ne")
+        ctk.CTkButton(f, text="Update charts...", width=140, height=32, fg_color=CARD,
+                      hover_color=CARD_HOVER, text_color=("#222", "#eee"),
+                      command=self.pick_update_folder).place(relx=1.0, x=-280, y=4, anchor="ne")
         self.drop = ctk.CTkFrame(f, fg_color=CARD, corner_radius=18, border_width=2,
                                  border_color=ACCENT, height=190)
         self.drop.pack(fill="x")
@@ -385,6 +389,91 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self.cfg["songs_dir"] = d
             save_config(self.cfg)
 
+    # ---------- update charts ----------
+    def pick_update_folder(self):
+        from tkinter import filedialog
+        d = filedialog.askdirectory(title="Folder with songs to update",
+                                    initialdir=str(self.songs_dir) if self.songs_dir.exists() else None)
+        if d:
+            self.show_update(Path(d))
+
+    def show_update(self, folder: Path):
+        songs = [p for p in library.song_folders(folder) if library.is_ours(p)]
+        f = ctk.CTkFrame(self, fg_color="transparent")
+        self.back_button(f)
+        self.header(f, "Update charts",
+                    f"{len(songs)} song{'s' if len(songs) != 1 else ''} made by this app in {folder}. "
+                    "Their charts are remade with the newest models from the audio already in each "
+                    "folder; the old chart is backed up first. Songs from anywhere else are never touched.")
+        lst = ctk.CTkScrollableFrame(f, fg_color=CARD, corner_radius=12)
+        lst.pack(fill="both", expand=True)
+        self.update_rows = []
+        for p in songs:
+            made = time.strftime("%d %b %Y", time.localtime((p / "notes.mid").stat().st_mtime))
+            var = ctk.BooleanVar(value=True)
+            row = ctk.CTkFrame(lst, fg_color="transparent")
+            row.pack(fill="x", padx=8, pady=2)
+            ctk.CTkCheckBox(row, text=p.name, variable=var).pack(side="left")
+            ctk.CTkLabel(row, text=f"charted {made}", text_color=MUTED).pack(side="right", padx=8)
+            self.update_rows.append((p, var))
+        if not songs:
+            ctk.CTkLabel(lst, text="No songs made by this app in that folder.", text_color=MUTED).pack(pady=24)
+        ctk.CTkButton(f, text=f"Update {len(songs)} chart{'s' if len(songs) != 1 else ''}", height=46,
+                      corner_radius=12, font=ctk.CTkFont(size=16, weight="bold"), fg_color=ACCENT,
+                      hover_color=ACCENT_HOVER, state="normal" if songs else "disabled",
+                      command=self.start_update).pack(fill="x", pady=(12, 0))
+        self.switch(f)
+
+    def start_update(self):
+        items = [p for p, var in self.update_rows if var.get()]
+        if not items:
+            return
+        self.working = True
+        self.stop.clear()
+        self.steps = pipeline.UPDATE_STEPS
+        f = ctk.CTkFrame(self, fg_color="transparent")
+        self.header(f, f"Updating {len(items)} chart{'s' if len(items) != 1 else ''}",
+                    "About 10-20 seconds per song.")
+        self.batch_now = ctk.CTkLabel(f, text="", font=ctk.CTkFont(size=17, weight="bold"), anchor="w")
+        self.batch_now.pack(fill="x")
+        card = ctk.CTkFrame(f, fg_color=CARD, corner_radius=18)
+        card.pack(fill="x", pady=(8, 0))
+        self.step_lbls = []
+        for s in self.steps:
+            lbl = ctk.CTkLabel(card, text=f"○  {s}", anchor="w", font=ctk.CTkFont(size=15), text_color=MUTED)
+            lbl.pack(fill="x", padx=24, pady=(12 if not self.step_lbls else 4, 0))
+            self.step_lbls.append(lbl)
+        ctk.CTkLabel(card, text="").pack(pady=2)
+        self.bar = ctk.CTkProgressBar(f, height=14, progress_color=ACCENT)
+        self.bar.set(0)
+        self.bar.pack(fill="x", pady=(16, 6))
+        self.pct = ctk.CTkLabel(f, text="Starting...", text_color=MUTED)
+        self.pct.pack()
+        ctk.CTkButton(f, text="Cancel", width=110, fg_color=CARD, hover_color=CARD_HOVER,
+                      text_color=("#222", "#eee"), command=self.cancel).pack(pady=12)
+        self.switch(f)
+        threading.Thread(target=self.update_work, args=(items,), daemon=True).start()
+
+    def update_work(self, items):
+        results, n, backups = [], len(items), set()
+        for k, folder in enumerate(items):
+            if self.stop.is_set():
+                break
+            self.ui(lambda k=k, folder=folder: self.batch_now.configure(text=f"Song {k + 1} of {n}:  {folder.name}"))
+            try:
+                saved = pipeline.update_song(folder, on_step=lambda i: self.ui(self.set_step, i),
+                                             on_progress=lambda fr, k=k: self.ui(self.set_progress, (k + fr) / n),
+                                             stop=self.stop)
+                backups.add(saved.parent)
+                results.append(("", folder.name, folder, ""))
+            except pipeline.Cancelled:
+                break
+            except Exception as e:
+                traceback.print_exc()
+                results.append(("", folder.name, None, str(e).splitlines()[0] if str(e) else e.__class__.__name__))
+        note = f"Old charts backed up to {sorted(backups)[0]}." if backups else ""
+        self.ui(self.show_batch_done, results, n, "updated", note)
+
     # ---------- convert a folder ----------
     def pick_batch_folder(self):
         from tkinter import filedialog
@@ -408,8 +497,15 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         lst.pack(fill="both", expand=True)
         lst.columnconfigure((1, 2), weight=1, uniform="n")
         self.batch_rows = []
+        # songs this app already made in the save folder, by song (either name order)
+        have = {}
+        if self.songs_dir.exists():
+            for folder in library.song_folders(self.songs_dir):
+                if library.is_ours(folder):
+                    have[library.song_key(*library.names_of(folder))] = folder
         for r, p in enumerate(files):
             a, t = search.names_from_file(p.stem)
+            old = have.get(library.song_key(a, t)) or have.get(library.song_key(t, a))
             var = ctk.BooleanVar(value=True)
             ctk.CTkCheckBox(lst, text="", variable=var, width=24).grid(row=2 * r, column=0, rowspan=2, padx=(8, 4))
             ea, et = ctk.CTkEntry(lst, placeholder_text="Artist"), ctk.CTkEntry(lst, placeholder_text="Song title")
@@ -417,8 +513,9 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             et.insert(0, t)
             ea.grid(row=2 * r, column=1, sticky="ew", pady=(8, 0))
             et.grid(row=2 * r, column=2, sticky="ew", padx=(8, 8), pady=(8, 0))
-            ctk.CTkLabel(lst, text=p.name, text_color=MUTED, anchor="w", font=ctk.CTkFont(size=11)).grid(
-                row=2 * r + 1, column=1, columnspan=2, sticky="w")
+            note = p.name + ("   • already converted: the old version is backed up and replaced" if old else "")
+            ctk.CTkLabel(lst, text=note, text_color="#e0a23a" if old else MUTED, anchor="w",
+                         font=ctk.CTkFont(size=11)).grid(row=2 * r + 1, column=1, columnspan=2, sticky="w")
             self.batch_rows.append((p, var, ea, et))
         out = ctk.CTkFrame(f, fg_color="transparent")
         out.pack(fill="x", pady=(10, 0))
@@ -479,7 +576,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         threading.Thread(target=self.batch_work, args=(items,), daemon=True).start()
 
     def batch_work(self, items):
-        results, n = [], len(items)
+        results, n, replaced = [], len(items), []
         for k, (src, a, t) in enumerate(items):
             if self.stop.is_set():
                 break
@@ -498,6 +595,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                     stop=self.stop, details=d, cover=cover)
                 shutil.rmtree(res.preview_dir, ignore_errors=True)  # no previews in batch mode
                 results.append((a, t, res.song_dir, ""))
+                replaced += res.replaced
             except pipeline.Cancelled:
                 break
             except Exception as e:
@@ -508,15 +606,18 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             done = sum(1 for r in results if r[2])
             self.ui(lambda done=done, k=k: self.batch_log.configure(
                 text=f"{done} done, {k + 1 - done} failed so far"))
-        self.ui(self.show_batch_done, results, n)
+        note = (f"{len(replaced)} earlier version{'s' if len(replaced) != 1 else ''} replaced; backed up "
+                f"to {replaced[0].parent}." if replaced else "")
+        self.ui(self.show_batch_done, results, n, "converted", note)
 
-    def show_batch_done(self, results, n):
+    def show_batch_done(self, results, n, verb="converted", note=""):
         self.working = False
         ok = [r for r in results if r[2]]
         f = ctk.CTkFrame(self, fg_color="transparent")
-        title = f"{len(ok)} of {n} song{'s' if n != 1 else ''} converted"
+        title = f"{len(ok)} of {n} song{'s' if n != 1 else ''} {verb}"
+        where = f"Saved to {self.songs_dir}. " if verb == "converted" else ""
         self.header(f, title + (" ✓" if len(ok) == n else ""),
-                    f"Saved to {self.songs_dir}. Rescan songs in Clone Hero to see them."
+                    f"{where}Rescan songs in Clone Hero to see the changes. {note}"
                     + ("" if len(results) == n else "  (Stopped early.)"))
         lst = ctk.CTkScrollableFrame(f, fg_color=CARD, corner_radius=12)
         lst.pack(fill="both", expand=True)
@@ -647,6 +748,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                         command=self.rescan).pack(side="left")
         ctk.CTkCheckBox(opts, text="Remove [brackets]", variable=self.tidy_brackets,
                         command=self.rescan).pack(side="left", padx=18)
+        ctk.CTkButton(opts, text="Find duplicates...", width=140, fg_color=CARD, hover_color=CARD_HOVER,
+                      text_color=("#222", "#eee"), command=self.show_dupes).pack(side="right")
         self.tidy_msg = ctk.CTkLabel(f, text=message, text_color=GOOD, anchor="w")
         self.tidy_msg.pack(fill="x", pady=(8, 0))
         self.tidy_list = ctk.CTkScrollableFrame(f, fg_color=CARD, corner_radius=12, height=300)
@@ -662,6 +765,66 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.tidy_undo.pack(side="left", expand=True, fill="x", padx=(12, 0))
         self.switch(f)
         self.rescan()
+
+    def show_dupes(self, message=""):
+        f = ctk.CTkFrame(self, fg_color="transparent")
+        self.back_button(f, self.show_tidy)
+        self.header(f, "Duplicate songs",
+                    f"The same song more than once in {self.tidy_dir}. Ticked copies go to the Recycle Bin "
+                    "(restorable). Copies with exactly the same chart are ticked for you; different "
+                    "versions (live, another charter, 2x bass pedal...) are listed but left alone.")
+        ctk.CTkLabel(f, text=message, text_color=GOOD, anchor="w", wraplength=740,
+                     justify="left").pack(fill="x")
+        lst = ctk.CTkScrollableFrame(f, fg_color=CARD, corner_radius=12)
+        lst.pack(fill="both", expand=True, pady=6)
+        groups = library.find_duplicates(self.tidy_dir) if self.tidy_dir.exists() else []
+        self.dupe_groups = []
+        for g in groups:
+            ctk.CTkLabel(lst, text=f"{g[0].artist + ' - ' if g[0].artist else ''}{g[0].title}",
+                         font=ctk.CTkFont(size=14, weight="bold"), anchor="w").pack(fill="x", padx=10, pady=(10, 0))
+            rows = []
+            for c in g:
+                var = ctk.BooleanVar(value=c.identical)
+                tag = ("keep (suggested)" if c.keep else
+                       "same chart as the kept copy" if c.identical else "different version")
+                try:
+                    rel = c.folder.relative_to(self.tidy_dir)
+                except ValueError:
+                    rel = c.folder
+                row = ctk.CTkFrame(lst, fg_color="transparent")
+                row.pack(fill="x", padx=14)
+                ctk.CTkCheckBox(row, text=str(rel), variable=var).pack(side="left")
+                ctk.CTkLabel(row, text=f"{tag}  ·  {c.charter}  ·  {', '.join(c.parts) or 'parts not listed'}"
+                                       f"  ·  {c.size_mb:.0f} MB", text_color=GOOD if c.keep else MUTED
+                             ).pack(side="right", padx=6)
+                rows.append((c, var))
+            self.dupe_groups.append(rows)
+        if not groups:
+            ctk.CTkLabel(lst, text="No duplicates found.", text_color=MUTED).pack(pady=24)
+        n = sum(var.get() for rows in self.dupe_groups for _, var in rows)
+        ctk.CTkButton(f, text="Move ticked copies to the Recycle Bin", height=42, fg_color=ACCENT,
+                      hover_color=ACCENT_HOVER, state="normal" if groups else "disabled",
+                      command=self.remove_dupes).pack(fill="x")
+        self.switch(f)
+
+    def remove_dupes(self):
+        paths, kept_whole = [], 0
+        for rows in self.dupe_groups:
+            ticked = [c for c, var in rows if var.get()]
+            if len(ticked) == len(rows):  # never remove every copy of a song
+                ticked = [c for c in ticked if not c.keep]
+                kept_whole += 1
+            paths += [c.folder for c in ticked]
+        if not paths:
+            self.show_dupes("Nothing ticked.")
+            return
+        n, errs = library.recycle(paths)
+        msg = f"Moved {n} cop{'ies' if n != 1 else 'y'} to the Recycle Bin. Rescan songs in Clone Hero."
+        if kept_whole:
+            msg += f" ({kept_whole} song{'s' if kept_whole != 1 else ''} had every copy ticked; the suggested one was kept.)"
+        if errs:
+            msg += f" {len(errs)} failed: {errs[0]}"
+        self.show_dupes(msg)
 
     def pick_tidy_folder(self):
         from tkinter import filedialog
@@ -844,7 +1007,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.working = False
         self.result = res
         f = ctk.CTkFrame(self, fg_color="transparent")
-        self.header(f, "Your song is ready ✓", f"Saved to {res.song_dir}")
+        self.header(f, "Your song is ready ✓", f"Saved to {res.song_dir}" +
+                    (f"  (your earlier version was backed up to {res.replaced[0].parent})" if res.replaced else ""))
 
         ctk.CTkLabel(f, text="Listen to the instruments", font=ctk.CTkFont(size=15, weight="bold")
                      ).pack(anchor="w", pady=(0, 6))
