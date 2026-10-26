@@ -6,4 +6,5 @@ imageio-ffmpeg
 demucs
 onnxruntime
 yt-dlp
+scikit-learn
 # torch/torchaudio are installed first, and basic-pitch (model file only) last, by setup.bat

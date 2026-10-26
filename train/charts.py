@@ -130,6 +130,44 @@ def parse_mid(path: Path) -> dict:
     return out
 
 
+LEVELS = {"expert": 96, "hard": 84, "medium": 72, "easy": 60}
+
+
+def parse_levels(path: Path) -> dict:
+    """Every difficulty of a chart, in ticks: {"tpq", "tempo": TempoMap, "five_lane",
+    "guitar"/"bass": {level: [(tick, lanes)]}, "drums": {level: [(tick, lane, tom)]}}.
+    Used to learn how charters reduce Expert to Hard, Medium and Easy."""
+    mid = mido.MidiFile(str(path), clip=True)
+    out = {"tpq": mid.ticks_per_beat, "tempo": TempoMap(mid), "five_lane": False}
+    for tr in mid.tracks:
+        kind = TRACKS.get(tr.name.strip().upper())
+        if not kind:
+            continue
+        notes = _notes(tr)
+        if kind == "drums" and any(n == 101 for _, n, _ in notes):
+            out["five_lane"] = True
+        toms = {n: [(a, b) for a, nn, b in notes if nn == n] for n in (110, 111, 112)}
+        levels = {}
+        for level, base in LEVELS.items():
+            if kind == "drums":
+                hits = set()
+                for tick, n, _ in notes:
+                    lane = n - base if base <= n <= base + 4 else (0 if level == "expert" and n == 95 else None)
+                    if lane is None:
+                        continue
+                    tom = lane in (2, 3, 4) and any(a <= tick < b for a, b in toms[110 + lane - 2])
+                    hits.add((tick, lane, tom))
+                levels[level] = sorted(hits)
+            else:
+                by = {}
+                for tick, n, _ in notes:
+                    if base <= n <= base + 4:
+                        by.setdefault(tick, set()).add(n - base)
+                levels[level] = [(t, tuple(sorted(l))) for t, l in sorted(by.items())]
+        out[kind] = levels
+    return out
+
+
 def beat_times(mid: mido.MidiFile, tm: TempoMap) -> tuple[list[float], list[float]]:
     """(beats, downbeats) in seconds from the tempo map and time signatures (before song.ini delay)."""
     end = max(sum(m.time for m in tr) for tr in mid.tracks)

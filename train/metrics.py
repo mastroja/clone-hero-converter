@@ -66,6 +66,42 @@ def contour(pred, gt, tol=TOL):
     return {"pairs": pairs, "direction": same_dir, "interval": same_int}
 
 
+def _bar_patterns(notes, downbeats):
+    """[(time, key)] -> per bar of the real chart, its notes as (position 0-1 in the bar, key)."""
+    notes = sorted(notes)
+    times = np.array([t for t, _ in notes])
+    pats = []
+    for a, b in zip(downbeats, downbeats[1:]):
+        lo, hi = np.searchsorted(times, a - 0.02), np.searchsorted(times, b - 0.02)
+        pats.append([((notes[k][0] - a) / (b - a), notes[k][1]) for k in range(lo, hi)])
+    return pats
+
+
+def _alike(p, q, tol=0.03):
+    return len(p) == len(q) and all(abs(x[0] - y[0]) <= tol and x[1] == y[1] for x, y in zip(p, q))
+
+
+def repeats(ours, real, downbeats, min_notes=4):
+    """Do we chart repeated sections the same way the real chart does?
+
+    ours, real: [(time, key)] with key the frets (or pad) of each note; downbeats: the real
+    chart's bar lines. Among pairs of bars the real chart plays identically (>= min_notes
+    notes), how many do we also chart identically ("kept"); and among pairs we chart
+    identically, how many the real chart plays differently ("copied")."""
+    rp, op = _bar_patterns(real, downbeats), _bar_patterns(ours, downbeats)
+    n = min(len(rp), len(op))
+    real_pairs = kept = our_pairs = copied = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            r_same = len(rp[i]) >= min_notes and _alike(rp[i], rp[j])
+            o_same = len(op[i]) >= min_notes and _alike(op[i], op[j])
+            real_pairs += r_same
+            kept += r_same and o_same
+            our_pairs += o_same
+            copied += o_same and not r_same
+    return {"real_pairs": real_pairs, "kept": kept, "our_pairs": our_pairs, "copied": copied}
+
+
 def summarize(rows):
     s = {k: sum(r[k] for r in rows) for k in rows[0]}
     P = s["onset_tp"] / max(1, s["n_pred"])

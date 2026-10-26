@@ -212,9 +212,18 @@ def _thin(notes, min_gap):
     return out
 
 
-def guitar_notes(timed, tm: TempoMap, difficulty: str):
+def _spb(tm):
+    """Seconds per beat at a tick, for the tempo map in use."""
+    if hasattr(tm, "time"):
+        return lambda t: tm.time(t + TPQ) - tm.time(t)
+    return lambda t: tm.spb
+
+
+def guitar_notes(timed, tm: TempoMap, difficulty: str, inst: str = "guitar"):
     """timed: [(seconds, lane or lanes[, sustain_s, hammer_on])] -> [(tick, lane, length, force)]
-    reduced for the difficulty. force is "hopo", "strum" or None (let the game decide)."""
+    reduced for the difficulty. force is "hopo", "strum" or None (let the game decide).
+    Which notes Hard/Medium/Easy keep comes from the learned reduction (chc.reduce) when its
+    model is available, else from GUITAR_RULES spacing."""
     gap, nlanes = GUITAR_RULES[difficulty]
     by_tick = {}
     for n in timed:
@@ -225,13 +234,22 @@ def guitar_notes(timed, tm: TempoMap, difficulty: str):
         tick = tm.tick(t)
         if tick in by_tick:
             continue  # two notes snapped onto one spot: keep the first, don't invent a chord
-        by_tick[tick] = [{l * nlanes // 5 for l in lanes},
-                         tm.tick(t + length) - tick if length > 0 else 0, hopo]
+        by_tick[tick] = [set(lanes), tm.tick(t + length) - tick if length > 0 else 0, hopo]
+    ticks = sorted(by_tick)
+    learned = None
+    if difficulty != "expert":
+        from . import reduce
+        learned = reduce.keep(inst, difficulty, [(t, tuple(sorted(by_tick[t][0]))) for t in ticks],
+                              TPQ, _spb(tm))
     notes = []
-    for tick in sorted(by_tick):
+    for k, tick in enumerate(ticks):
+        if learned is not None and not learned[k]:
+            continue
         lanes, length, hopo = by_tick[tick]
-        notes.append((tick, tuple(sorted(lanes)[:MAX_LANES[difficulty]]), length, hopo))
-    notes = _thin(notes, gap)
+        mapped = sorted({l * nlanes // 5 for l in lanes})[:MAX_LANES[difficulty]]
+        notes.append((tick, tuple(mapped), length, hopo))
+    if learned is None:
+        notes = _thin(notes, gap)
     out, prev = [], None
     for k, (tick, lanes, length, hopo) in enumerate(notes):
         nxt = notes[k + 1][0] if k + 1 < len(notes) else None
@@ -251,8 +269,16 @@ def guitar_notes(timed, tm: TempoMap, difficulty: str):
     return out
 
 
-def drum_notes(timed, tm: TempoMap, difficulty: str):
-    """timed: [(seconds, lane 0-4, is_tom)] -> [(tick, lane, is_tom)] reduced for the difficulty."""
+def drum_notes(timed, tm: TempoMap, difficulty: str, inst: str = "drums"):
+    """timed: [(seconds, lane 0-4, is_tom)] -> [(tick, lane, is_tom)] reduced for the difficulty:
+    the learned reduction (chc.reduce) picks the hits Hard/Medium/Easy keep when its model is
+    available, else DRUM_RULES spacing per pad."""
+    if difficulty != "expert":
+        from . import reduce
+        expert = drum_notes(timed, tm, "expert")
+        learned = reduce.keep("drums", difficulty, expert, TPQ, _spb(tm))
+        if learned is not None:
+            return [h for h, k in zip(expert, learned) if k]
     rules, last, out, seen, hands = DRUM_RULES[difficulty], {}, [], set(), {}
     for d in sorted(timed):
         t, lane, tom = d[:3]
@@ -330,6 +356,7 @@ def write_mid(path: Path, bpm: float, offset: float, guitar=None, bass=None, dru
     counts = {}
     for name, timed, fn in (("PART GUITAR", guitar, guitar_notes), ("PART BASS", bass, guitar_notes),
                             ("PART DRUMS", drums, drum_notes)):
+        inst = name.split()[1].lower()
         if not timed:
             continue
         if beatmap is not None and snap:
@@ -337,7 +364,7 @@ def write_mid(path: Path, bpm: float, offset: float, guitar=None, bass=None, dru
                 beatmap.fit_grid([n[0] for n in timed])
             else:
                 beatmap.bar_grid = None
-        by_diff = {d: fn(timed, tm, d) for d in DIFF_BASE}
+        by_diff = {d: fn(timed, tm, d, inst) for d in DIFF_BASE}
         mid.tracks.append(_track(name, _events(by_diff, drums=fn is drum_notes)))
         counts[name] = len({n[0] for n in by_diff["expert"]})  # notes and chords, not lanes
     mid.save(path)

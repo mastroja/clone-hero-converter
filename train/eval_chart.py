@@ -22,6 +22,7 @@ from chc import nn as cnn
 from . import charts, data, metrics
 
 VARIANTS = ["now", "grid", "smooth", "repeat", "both"]
+SECT_THR = {}  # per-instrument override for the section variants (tuning)
 INST = ["guitar", "bass", "drums"]
 
 
@@ -58,6 +59,13 @@ def tick_stats(path):
     return out
 
 
+def note_keys(notes, inst):
+    """[(time, key)]: frets for guitar/bass, (pad, tom) for drums."""
+    if inst == "drums":
+        return [(n[0], (n[1], bool(n[2]))) for n in notes]
+    return [(n[0], tuple(n[1])) for n in notes]
+
+
 def chart_events(parsed, inst):
     if inst == "drums":
         return [(t, 0 if l == 0 else 1 if l == 1 else 2 + (l - 2) * 2 + int(tom)) for t, l, tom in parsed["drums"]]
@@ -83,9 +91,11 @@ def main():
     print(f"{len(rows)} {split} songs, repeat threshold {thr}", flush=True)
     score = {v: {k: [] for k in INST} for v in VARIANTS}
     stats = {v: {k: [] for k in INST} for v in VARIANTS + ["real"]}
+    reps = {v: {k: {} for k in INST} for v in VARIANTS}
     tmp = Path(tempfile.mkdtemp())
     for n, (i, s) in enumerate(rows):
-        p = cnn.predict(mix_model, np.load(data.feat_path(i, "mix")), "cuda")
+        mix_feats = np.load(data.feat_path(i, "mix"))
+        p = cnn.predict(mix_model, mix_feats, "cuda")
         b, d = beats.track(p[:, 0], p[:, 1])
         if len(b) < 16:
             continue
@@ -100,7 +110,15 @@ def main():
             bm = chart.BeatMap(b, d, smooth=4 if v in ("smooth", "both") else 0)
             parts = dict(decoded)
             if v in ("repeat", "both"):
-                parts = {k: structure.make_consistent(k, notes, feats[k], bm, thr) for k, notes in parts.items()}
+                parts = {k: structure.make_consistent(k, notes, feats[k], bm, thr, method="bars")
+                         for k, notes in parts.items()}
+            elif v == "final":  # what the app does: per-instrument defaults
+                parts = {k: structure.make_consistent(k, notes, feats[k], bm) for k, notes in parts.items()}
+            elif v.startswith("sect"):  # section matching; "_inst": instrument only; "_vote": majority
+                parts = {k: structure.make_consistent(k, notes, feats[k], bm, SECT_THR.get(k),
+                                                      None if "_inst" in v else mix_feats,
+                                                      best_copy="_vote" not in v)
+                         for k, notes in parts.items()}
             out = tmp / f"{v}.mid"
             chart.write_mid(out, bm.bpm, 0.0, guitar=parts.get("guitar"), bass=parts.get("bass"),
                             drums=parts.get("drums"), snap=True, beatmap=bm, grid=v != "now")
@@ -108,6 +126,8 @@ def main():
             st = tick_stats(out)
             for k in parts:
                 score[v][k].append(metrics.score(chart_events(back, k), data.events(s, k)))
+                c = metrics.repeats(note_keys(back[k], k), note_keys(s["notes"][k], k), s["downbeats"])
+                reps[v][k] = {x: reps[v][k].get(x, 0) + c[x] for x in c}
                 if k in st:
                     stats[v][k].append(st[k])
         real = tick_stats(Path(s["folder"]) / "notes.mid")
@@ -117,7 +137,8 @@ def main():
         print(n, s["name"], flush=True)
     for k in INST:
         print(f"\n{k}:")
-        print(f"  {'':8s} {'on time F1':>11s} {'exact F1':>9s} {'off grid':>9s} {'repeats alike':>14s}")
+        print(f"  {'':8s} {'on time F1':>11s} {'exact F1':>9s} {'off grid':>9s} {'repeats alike':>14s}"
+              f" {'real repeats kept':>18s} {'copied wrongly':>15s}")
         for v in VARIANTS + ["real"]:
             st = np.array(stats[v][k]) if stats[v][k] else np.zeros((0, 2))
             off = np.nanmean(st[:, 0]) if len(st) else np.nan
@@ -126,7 +147,11 @@ def main():
                 print(f"  {'real':8s} {'':>11s} {'':>9s} {off:9.1%} {same:14.1%}")
                 continue
             sm = metrics.summarize(score[v][k]) if score[v][k] else None
-            print(f"  {v:8s} {sm['onset_F1']:11.3f} {sm['exact_F1']:9.3f} {off:9.1%} {same:14.1%}")
+            r = reps[v][k]
+            kept = r.get("kept", 0) / max(1, r.get("real_pairs", 0))
+            wrong = r.get("copied", 0) / max(1, r.get("our_pairs", 0))
+            print(f"  {v:8s} {sm['onset_F1']:11.3f} {sm['exact_F1']:9.3f} {off:9.1%} {same:14.1%}"
+                  f" {kept:18.1%} {wrong:15.1%}")
 
 
 if __name__ == "__main__":
