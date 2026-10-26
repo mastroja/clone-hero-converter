@@ -4,4 +4,4 @@ if not exist .venv\Scripts\pythonw.exe (
   echo First-time setup needed...
   call setup.bat
 )
-start "" .venv\Scripts\pythonw.exe app.py
+start "" .venv\Scripts\pythonw.exe rockwizard.pyw

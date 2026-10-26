@@ -7,4 +7,9 @@ demucs
 onnxruntime
 yt-dlp
 scikit-learn
+fastapi
+uvicorn
+python-multipart
+qrcode
+pywebview
 # torch/torchaudio are installed first, and basic-pitch (model file only) last, by setup.bat

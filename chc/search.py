@@ -227,6 +227,15 @@ def song_details(artist: str, title: str) -> Details | None:
     return d
 
 
+def lookup(artist: str, title: str) -> Details | None:
+    """Song details for (artist, title), trying the swapped order too ('Song - Artist' names);
+    None when unknown or offline."""
+    try:
+        return song_details(artist, title) or (song_details(title, artist) if artist else None)
+    except Exception:
+        return None
+
+
 def cover_art(details: Details, dest: Path) -> Path | None:
     """Download the album cover (500 px) to dest; None when there is none."""
     if not details or not details.release_group:

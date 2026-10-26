@@ -89,10 +89,16 @@ def models():
     return _models
 
 
-def keep(inst: str, level: str, notes, tpq: int, spb):
-    """Boolean per Expert note: kept on this level. None when no model is available."""
+def keep(inst: str, level: str, notes, tpq: int, spb, cap: int | None = None):
+    """Boolean per Expert note: kept on this level (at most cap notes: the likeliest, so a level
+    is never busier than the one above). None when no model is available."""
     m = models().get((inst, level))
     if m is None or not notes:
         return None
     X = drum_features(notes, tpq, spb) if inst == "drums" else fret_features(notes, tpq, spb)
-    return m["model"].predict_proba(X)[:, 1] >= m["threshold"]
+    p = m["model"].predict_proba(X)[:, 1]
+    kept = p >= m["threshold"]
+    if cap is not None and kept.sum() > cap:
+        kept = np.zeros(len(p), bool)
+        kept[np.argsort(-p)[:max(0, int(cap * 0.95))]] = True
+    return kept
