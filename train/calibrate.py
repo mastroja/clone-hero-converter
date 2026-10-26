@@ -35,13 +35,21 @@ def main():
     gt_notes = [n for _, s in rows for n in s["notes"][inst]]
     print(f"{len(rows)} val songs; real charts: {chord_mix(gt_notes)}")
 
+    gt_charts = [[(n[0], tuple(n[1])) for n in s["notes"][inst]] for _, s in rows]
+
     def chart_score(thr, ratios, rel=0.0):
-        res, notes = [], []
-        for p, tr in zip(probs, truths):
+        """Summary (plus "shape": share of note-to-note moves going the same way as the real
+        chart) and the decoded notes."""
+        res, notes, shape = [], [], {"pairs": 0, "direction": 0, "interval": 0}
+        for p, tr, gt in zip(probs, truths, gt_charts):
             got = ml.decode_fretted(inst, p, thr, ratios, rel=rel)
             notes += got
             res.append(metrics.score([(t, l) for t, lanes, *_ in got for l in lanes], tr))
-        return metrics.summarize(res), notes
+            c = metrics.contour([(n[0], n[1]) for n in got], gt)
+            shape = {k: shape[k] + c[k] for k in shape}
+        sm = metrics.summarize(res)
+        sm["shape"] = shape["direction"] / max(1, shape["pairs"])
+        return sm, notes
 
     def chord_share(notes, size=2):
         return sum(len(n[1]) >= size for n in notes) / max(1, len(notes))
@@ -73,13 +81,18 @@ def main():
     decode = {"thr": thr, "ratios": list(ratios), "hopo": 0.5, "sus": 0.5, "rel": 0.0}
     nl = cnn.n_lanes(kind)
     if model.n_out >= nl + 5:
-        # how much the up/same/down calls may move frets (0 = ignore them)
+        # how much the up/same/down calls may move frets (0 = ignore them). Judged on melody
+        # shape (does each move go the way the real chart's does), which players feel and exact
+        # frets barely register, as long as exact frets lose no more than a hair (0.01).
         tries = [(chart_score(thr, ratios, w)[0], w) for w in (0.0, 0.5, 1.0, 2.0, 4.0)]
         for sc, w in tries:
-            print(f"  direction weight {w}: exact-frets F1 {sc['exact_F1']:.3f} fret accuracy {sc['lane_acc']:.3f}")
-        sc, w = max(tries, key=lambda x: x[0]["exact_F1"])
+            print(f"  direction weight {w}: melody shape {sc['shape']:.1%} exact-frets F1 {sc['exact_F1']:.3f} "
+                  f"fret accuracy {sc['lane_acc']:.3f}")
+        floor = tries[0][0]["exact_F1"] - 0.01
+        sc, w = max((t for t in tries if t[0]["exact_F1"] >= floor), key=lambda x: x[0]["shape"])
         decode["rel"] = w
-        print(f"direction weight {w}: exact-frets F1 {sc['exact_F1']:.3f} fret accuracy {sc['lane_acc']:.3f}")
+        print(f"direction weight {w}: melody shape {sc['shape']:.1%} exact-frets F1 {sc['exact_F1']:.3f} "
+              f"fret accuracy {sc['lane_acc']:.3f}")
     if model.n_out >= nl + 2:
         # hammer-on / sustain thresholds judged on the real notes' positions
         for ch, key, true_of in ((nl, "hopo", lambda n: bool(n[3])), (nl + 1, "sus", lambda n: n[2] > 0)):

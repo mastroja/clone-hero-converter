@@ -70,9 +70,16 @@ def main():
     index = data.load_index()
     mix_model, _ = ml.load("mix")
     models = {k: ml.load(k)[0] for k in INST}
+
+    def feat_file(i, s, k):
+        """The app models' input for this song: v2 files for v2-kind models, else the v3
+        song-id layout (htdemucs_ft stems) for e.g. the pitch-sharp guitar_hr / bass_hr."""
+        fkind = ml._meta[k]["features"]
+        return data.dm_path(i, k) if fkind == k else data.V3 / "feats" / f"{data.song_id(s)}_ft_{fkind}.npy"
+
     rows = [(i, s) for i, s in enumerate(index) if data.split_of(s) == split
             and data.feat_path(i, "mix").exists() and len(s["beats"]) > 16
-            and any(data.dm_path(i, k).exists() and k in s["notes"] for k in INST)]
+            and any(feat_file(i, s, k).exists() and k in s["notes"] for k in INST)]
     print(f"{len(rows)} {split} songs, repeat threshold {thr}", flush=True)
     score = {v: {k: [] for k in INST} for v in VARIANTS}
     stats = {v: {k: [] for k in INST} for v in VARIANTS + ["real"]}
@@ -84,8 +91,8 @@ def main():
             continue
         decoded, feats = {}, {}
         for k in INST:
-            if k in s["notes"] and data.dm_path(i, k).exists():
-                feats[k] = np.load(data.dm_path(i, k))
+            if k in s["notes"] and feat_file(i, s, k).exists():
+                feats[k] = np.load(feat_file(i, s, k))
                 prob = cnn.predict(models[k], feats[k], "cuda")
                 decoded[k] = ml.decode_drums(prob) if k == "drums" else \
                     ml.decode_fretted(k, prob, **ml.decode_settings(k))

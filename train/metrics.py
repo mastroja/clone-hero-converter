@@ -32,6 +32,40 @@ def score(pred_events, gt_events, tol=TOL):
             "exact_tp": exact_tp, "n_pred": len(p), "n_gt": len(g)}
 
 
+def match(pred_times, gt_times, tol=TOL):
+    """One-to-one nearest matching: {pred index: gt index} for notes within tol seconds."""
+    pt, gt = np.asarray(pred_times), np.asarray(gt_times)
+    used, out = np.zeros(len(pt), bool), {}
+    for j, t in enumerate(gt):
+        if not len(pt):
+            break
+        k = int(np.argmin(np.where(used, 1e9, abs(pt - t))))
+        if not used[k] and abs(pt[k] - t) <= tol:
+            used[k] = True
+            out[k] = j
+    return out
+
+
+def contour(pred, gt, tol=TOL):
+    """Melody shape agreement between two charts. pred, gt: [(time, lanes)] sorted by time.
+
+    For every two notes in a row that are found in both charts (and are also neighbours in the
+    real one), compare how the lowest fret moves: up, same or down. Returns counts
+    {"pairs", "direction" (moves the same way), "interval" (moves by the same number of frets)}.
+    """
+    m = match([p[0] for p in pred], [g[0] for g in gt], tol)
+    sign = lambda d: (d > 0) - (d < 0)
+    pairs = same_dir = same_int = 0
+    for k in range(len(pred) - 1):
+        if k in m and k + 1 in m and m[k + 1] == m[k] + 1:
+            dp = min(pred[k + 1][1]) - min(pred[k][1])
+            dg = min(gt[m[k + 1]][1]) - min(gt[m[k]][1])
+            pairs += 1
+            same_dir += sign(dp) == sign(dg)
+            same_int += dp == dg
+    return {"pairs": pairs, "direction": same_dir, "interval": same_int}
+
+
 def summarize(rows):
     s = {k: sum(r[k] for r in rows) for k in rows[0]}
     P = s["onset_tp"] / max(1, s["n_pred"])

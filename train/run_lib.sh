@@ -6,6 +6,13 @@ DONE=${DONE:-data/v3/done}
 mkdir -p data/v3 models/v3 $DONE
 log() { echo "$1 $(date)" >> $LOG; }
 
+# keep_awake <marker>: start the keep-awake helper fully detached. A plain `&` child of bash
+# does not survive on Windows, so go through PowerShell's Start-Process.
+keep_awake() {
+  powershell.exe -NoProfile -Command "Start-Process -WindowStyle Hidden -WorkingDirectory '$(pwd -W)' \
+    -FilePath '.venv\\Scripts\\pythonw.exe' -ArgumentList 'train/keep_awake.py','\"$1\"','$LOG'"
+}
+
 # one run at a time (a run that is still finishing its pause holds the lock)
 if [ -f data/v3/RUNNING ] && kill -0 "$(cat data/v3/RUNNING)" 2>/dev/null; then
   echo "A v3 run is still going (maybe finishing a pause); try again in a minute."

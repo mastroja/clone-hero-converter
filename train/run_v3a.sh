@@ -9,7 +9,7 @@
 # Pause: bash train/pause.sh   Resume: bash train/resume.sh a
 cd "$(dirname "$0")/.."
 source train/run_lib.sh
-.venv/Scripts/pythonw.exe train/keep_awake.py "v3 part 1 done" $LOG &
+keep_awake "v3 part 1 done"
 log "v3 part 1 start"
 [ -f data/v3/index.json ] || $PY -m train.build_index "G:/Clone Hero/songs/Quickplay" --v3 >> $LOG 2>&1
 step separate "$PY -m train.separate_v3" data/v3/separate.log

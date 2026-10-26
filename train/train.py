@@ -32,6 +32,9 @@ class Bank:
         self.n_ch = n_out or len(cnn.CHANNELS[kind])
         self.n_lanes = cnn.n_lanes(kind)
         self.feats, self.stats, self.evs, self.attrs, self.dirs = {}, {}, {}, {}, {}
+        # converted five-lane drum charts always make blue a tom and yellow a cymbal, which real
+        # pro-drum charts often don't: those songs teach kick, snare and timing, not cymbal vs tom
+        self.no_cym_tom = {i for i, s in items if cnn.instrument(kind) == "drums" and s.get("five_lane")}
         for i, s in items:
             f = np.load(path(i, s, kind), mmap_mode="r")
             self.feats[i] = f
@@ -72,7 +75,10 @@ class Bank:
         if len(x) < WIN:
             x = np.pad(x, ((0, WIN - len(x)), (0, 0)))
             y = np.pad(y, ((0, WIN - len(y)), (0, 0)))
-        return x, y
+        m = np.ones_like(y)  # which targets count towards the loss
+        if i in self.no_cym_tom:
+            m[:, 2:] = 0.0  # drums channels 2-7: yellow/blue/green, cymbal or tom
+        return x, y, m
 
 
 def attribute_scores(probs, songs, kind):
@@ -172,6 +178,10 @@ def main():
     train_items, dm_items, val_dm, val_clean = split_items(layout, args.kind, index)
     if args.max_songs:
         train_items, dm_items = train_items[:args.max_songs], dm_items[:args.max_songs]
+    if cnn.instrument(args.kind) == "drums":
+        # judge drums on real pro-drum charts only (converted five-lane cymbal/tom labels are guesses)
+        val_dm = [x for x in val_dm if not x[1].get("five_lane")]
+        val_clean = [x for x in val_clean if not x[1].get("five_lane")]
     # score on Demucs stems when we have them: that is what the app feeds the model
     val_items, val_path = (val_dm, layout.dm) if val_dm else (val_clean, layout.clean)
     print(f"{args.kind} ({args.data}, Demucs {args.dm_src}): {len(train_items)} original-stem + "
@@ -201,7 +211,10 @@ def main():
         pw[n_l], pw[n_l + 1] = 3.0, 1.0  # hammer-on flags are sparse; sustain spans are not
     if n_out > n_l + 2:
         pw[n_l + 2:] = 3.0
-    lossf = tnn.BCEWithLogitsLoss(pos_weight=pw)
+    bce = tnn.BCEWithLogitsLoss(pos_weight=pw, reduction="none")
+
+    def lossf(logits, y, m):
+        return (bce(logits, y) * m).sum() / m.sum().clamp(min=1.0)
     t0 = time.time()
     run, best_f, start = 0.0, -1.0, 1
 
@@ -231,12 +244,13 @@ def main():
 
     for step in range(start, args.steps + 1):
         model.train()
-        xs, ys = zip(*(banks[rng.choice(len(banks), p=weights)].window(rng) for _ in range(args.batch)))
+        xs, ys, ms = zip(*(banks[rng.choice(len(banks), p=weights)].window(rng) for _ in range(args.batch)))
         x = torch.from_numpy(np.stack(xs)).to(device)
         y = torch.from_numpy(np.stack(ys)).to(device)
+        m = torch.from_numpy(np.stack(ms)).to(device)
         x = x + 0.05 * torch.randn_like(x)  # light noise augmentation
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss = lossf(model(x).float(), y)
+            loss = lossf(model(x).float(), y, m)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         tnn.utils.clip_grad_norm_(model.parameters(), 1.0)

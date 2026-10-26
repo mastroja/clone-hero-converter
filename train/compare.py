@@ -47,6 +47,7 @@ def score(inst, ck, kind, model, layout, rows):
         return {"pad-and-type F1": data.prf(tp, fp, fn)[2], "any-hit F1": data.prf(atp, afp, afn)[2]}
     settings = {"thr": 0.35, "ratios": None, "hopo": 0.5, "sus": 0.5, "rel": 1.0, **ck.get("decode", {})}
     res, notes = [], []
+    shape = {"pairs": 0, "direction": 0, "interval": 0}
     h = [0, 0, 0]
     su = [0, 0, 0]
     for i, s in rows:
@@ -55,6 +56,8 @@ def score(inst, ck, kind, model, layout, rows):
         notes += got
         truth = data.events(s, inst)
         res.append(metrics.score([(t, l) for t, lanes, *_ in got for l in lanes], truth))
+        c = metrics.contour([(n[0], n[1]) for n in got], [(n[0], tuple(n[1])) for n in s["notes"][inst]])
+        shape = {k: shape[k] + c[k] for k in shape}
         # hammer-ons and sustains on notes found at the right time
         times = np.array([g[0] for g in got])
         for n in s["notes"][inst]:
@@ -74,7 +77,10 @@ def score(inst, ck, kind, model, layout, rows):
     c = Counter(min(len(n[1]), 3) for n in notes)
     tot = max(1, sum(c.values()))
     return {"notes at the right time F1": sm["onset_F1"], "exact frets F1": sm["exact_F1"],
-            "fret accuracy": sm["lane_acc"], "hammer-on F1": data.prf(*h)[2],
+            "fret accuracy": sm["lane_acc"],
+            "melody shape (same moves)": shape["direction"] / max(1, shape["pairs"]),
+            "same jump size": shape["interval"] / max(1, shape["pairs"]),
+            "hammer-on F1": data.prf(*h)[2],
             "sustain F1": data.prf(*su)[2],
             "chords 1/2/3": " / ".join(f"{c[k] / tot:.0%}" for k in (1, 2, 3))}
 
