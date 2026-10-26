@@ -12,11 +12,12 @@ from chc import nn as cnn
 from . import data
 from .make_features import load_stem
 
-KINDS = ["guitar", "guitar_hr", "bass", "bass_hr", "drums"]
+KINDS = ["guitar", "guitar_hr", "bass", "bass_hr", "drums", "drums_hq"]
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-# Demucs stem file -> (source tag, instrument)
-DM = {"ft_other": ("ft", "guitar"), "ft_bass": ("ft", "bass"), "ft_drums": ("ft", "drums"),
-      "s6_guitar": ("s6", "guitar")}
+# Demucs stem file -> (source tag, instrument, sample rate); a kind uses the stems at its rate
+DM = {"ft_other": ("ft", "guitar", features.SR), "ft_bass": ("ft", "bass", features.SR),
+      "ft_drums": ("ft", "drums", features.SR), "s6_guitar": ("s6", "guitar", features.SR),
+      "ft_drums44": ("ft", "drums", 44100)}
 
 
 def jobs_for(song, kinds):
@@ -28,9 +29,9 @@ def jobs_for(song, kinds):
             continue
         if inst in song["stems"]:
             yield song["stems"][inst], out / f"{sid}_clean_{kind}.npy", kind
-        for stem, (src, i2) in DM.items():
+        for stem, (src, i2, sr) in DM.items():
             p = data.V3 / "stems" / sid / f"{stem}.flac"
-            if i2 == inst and p.exists():
+            if i2 == inst and sr == features.rate(kind) and p.exists():
                 yield [str(p)], out / f"{sid}_{src}_{kind}.npy", kind
 
 
@@ -46,14 +47,14 @@ def main():
     for s in index:
         for paths, dest, kind in jobs_for(s, kinds):
             if not dest.exists():
-                todo.setdefault(tuple(paths), []).append((dest, kind))
+                todo.setdefault((tuple(paths), features.rate(kind)), []).append((dest, kind))
     items = list(todo.items())
     print(len(items), "audio files,", sum(len(v) for v in todo.values()), "feature files to build", flush=True)
     done = 0
     with ThreadPoolExecutor(max_workers=12) as ex:
         for k in range(0, len(items), 24):  # bounded batches keep memory flat
             batch = items[k:k + 24]
-            for (paths, outs), wave in zip(batch, ex.map(lambda it: load_stem(list(it[0])), batch)):
+            for ((paths, sr), outs), wave in zip(batch, ex.map(lambda it: load_stem(list(it[0][0]), it[0][1]), batch)):
                 if len(wave) < features.SR:
                     continue
                 for dest, kind in outs:

@@ -19,6 +19,7 @@ for _k in ("guitar2", "guitar_hr"):
     CHANNELS[_k] = CHANNELS["guitar"]
 for _k in ("bass2", "bass_hr"):
     CHANNELS[_k] = CHANNELS["bass"]
+CHANNELS["drums_hq"] = CHANNELS["drums"]
 # optional extra outputs (train --rel): is this note's lowest fret above, equal to or below
 # the previous note's? Charters place frets by the melody's shape, not absolute pitch.
 REL = ["up", "same", "down"]

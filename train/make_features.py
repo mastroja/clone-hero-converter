@@ -12,15 +12,15 @@ from chc import audio, features
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
-def decode(path: str) -> np.ndarray:
+def decode(path: str, sr: int = features.SR) -> np.ndarray:
     r = subprocess.run([audio.ffmpeg_exe(), "-v", "error", "-i", path, "-ac", "1", "-ar",
-                        str(features.SR), "-f", "f32le", "-"],
+                        str(sr), "-f", "f32le", "-"],
                        capture_output=True, creationflags=NO_WINDOW)
     return np.frombuffer(r.stdout, dtype=np.float32)
 
 
-def load_stem(paths: list[str]) -> np.ndarray:
-    waves = [decode(p) for p in paths]
+def load_stem(paths: list[str], sr: int = features.SR) -> np.ndarray:
+    waves = [decode(p, sr) for p in paths]
     n = max(len(w) for w in waves)
     mix = np.zeros(n, np.float32)
     for w in waves:

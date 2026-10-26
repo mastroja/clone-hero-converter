@@ -22,8 +22,21 @@ KINDS = {
     # bins per semitone, so neighbouring notes (one fret apart) land in different bins
     "guitar_hr": [(2048, 96, 60.0, 9000.0), (8192, 216, 70.0, 4200.0)],
     "bass_hr": [(2048, 64, 28.0, 2500.0), (8192, 192, 35.0, 1400.0)],
+    # full-bandwidth drums at 44.1 kHz: hi-hats and cymbals live largely above the 11 kHz the
+    # 22 kHz kinds can hear, which is what tells a hi-hat from a snare
+    "drums_hq": [(4096, 128, 25.0, 20000.0)],
 }
+RATES = {"drums_hq": 44100}  # kinds that need audio at a higher sample rate than SR
 _banks: dict = {}
+
+
+def rate(kind: str) -> int:
+    """Sample rate a feature kind expects its audio at (frames per second stay FPS)."""
+    return RATES.get(kind, SR)
+
+
+def hop(kind: str) -> int:
+    return HOP * rate(kind) // SR
 
 
 def parts(kind: str) -> list:
@@ -36,15 +49,15 @@ def n_bins(kind: str) -> int:
     return sum(p[1] for p in parts(kind))
 
 
-def _bank(part: tuple, device) -> torch.Tensor:
-    key = (part, str(device))
+def _bank(part: tuple, device, sr: int = SR) -> torch.Tensor:
+    key = (part, str(device), sr)
     if key not in _banks:
         n_fft, n_bins, lo, hi = part
-        freqs = np.fft.rfftfreq(n_fft, 1 / SR)
+        freqs = np.fft.rfftfreq(n_fft, 1 / sr)
         centers = np.geomspace(lo, hi, n_bins + 2)
         fb = np.zeros((n_bins, len(freqs)), np.float32)
         # never narrower than ~2 FFT bins (1 for the long pitch window, which is already fine)
-        min_w = (1 if n_fft >= 8192 else 2) * SR / n_fft
+        min_w = (1 if n_fft >= 8192 else 2) * sr / n_fft
         for i in range(n_bins):
             l, c, r = centers[i], centers[i + 1], centers[i + 2]
             l, r = min(l, c - min_w), max(r, c + min_w)
@@ -57,14 +70,16 @@ def _bank(part: tuple, device) -> torch.Tensor:
 
 
 def compute(wave: np.ndarray, kind: str, device="cuda") -> np.ndarray:
-    """wave: mono float32 at SR. Returns (frames, bins) float16 log-magnitudes."""
+    """wave: mono float32 at rate(kind) (SR for most kinds). Returns (frames, bins) float16
+    log-magnitudes at FPS frames per second."""
     x = torch.from_numpy(wave).to(device)
+    sr, h = rate(kind), hop(kind)
     outs = []
     for part in parts(kind):
         n_fft = part[0]
         win = torch.hann_window(n_fft, device=device)
-        spec = torch.stft(x, n_fft, HOP, window=win, center=True, return_complex=True).abs()
-        outs.append(torch.log1p(30.0 * (_bank(part, device) @ spec)))
+        spec = torch.stft(x, n_fft, h, window=win, center=True, return_complex=True).abs()
+        outs.append(torch.log1p(30.0 * (_bank(part, device, sr) @ spec)))
     out = torch.cat(outs, 0).T.contiguous()  # centred frames line up across window sizes
     return out.half().cpu().numpy()
 

@@ -32,9 +32,32 @@ def drum_channel(lane, tom):
     return 0 if lane == 0 else 1 if lane == 1 else 2 + (lane - 2) * 2 + int(tom)
 
 
+def snare_hat_mixups(pred, truth, tol=metrics.TOL):
+    """Real snare hits (channel 1) we chart only as a yellow cymbal / hi-hat (channel 2) at that
+    moment, and the other way round."""
+    def near(ch, t, events):
+        return any(c == ch and abs(x - t) <= tol for x, c in events)
+    out = {"snare": 0, "snare as hat": 0, "hat": 0, "hat as snare": 0}
+    by_time = sorted(pred)
+    times = np.array([t for t, _ in by_time])
+    for t, c in truth:
+        if c not in (1, 2):
+            continue
+        lo, hi = np.searchsorted(times, t - tol), np.searchsorted(times, t + tol, side="right")
+        here = by_time[lo:hi]
+        if c == 1:
+            out["snare"] += 1
+            out["snare as hat"] += not near(1, t, here) and near(2, t, here)
+        else:
+            out["hat"] += 1
+            out["hat as snare"] += not near(2, t, here) and near(1, t, here)
+    return out
+
+
 def score(inst, ck, kind, model, layout, rows):
     if inst == "drums":
         tp = fp = fn = atp = afp = afn = 0
+        mix = {"snare": 0, "snare as hat": 0, "hat": 0, "hat as snare": 0}
         for i, s in rows:
             p = cnn.predict(model, np.load(layout.dm(i, s, kind)), "cuda")
             got = ml.decode_drums(p, ck.get("thr"))
@@ -44,7 +67,11 @@ def score(inst, ck, kind, model, layout, rows):
             tp, fp, fn = tp + a, fp + b, fn + c
             a, b, c = data.f1([(t, 0) for t, _ in pred], [(t, 0) for t, _ in truth], 1)
             atp, afp, afn = atp + a, afp + b, afn + c
-        return {"pad-and-type F1": data.prf(tp, fp, fn)[2], "any-hit F1": data.prf(atp, afp, afn)[2]}
+            for k, v in snare_hat_mixups(pred, truth).items():
+                mix[k] += v
+        return {"pad-and-type F1": data.prf(tp, fp, fn)[2], "any-hit F1": data.prf(atp, afp, afn)[2],
+                "real snares charted as hi-hat": mix["snare as hat"] / max(1, mix["snare"]),
+                "real hi-hats charted as snare": mix["hat as snare"] / max(1, mix["hat"])}
     settings = {"thr": 0.35, "ratios": None, "hopo": 0.5, "sus": 0.5, "rel": 1.0, **ck.get("decode", {})}
     res, notes = [], []
     shape = {"pairs": 0, "direction": 0, "interval": 0}

@@ -42,19 +42,20 @@ def stem_source(kind: str) -> str:
     return _meta[kind]["stems"]
 
 
-def to_model_rate(wave: np.ndarray, sr: int, device="cuda") -> np.ndarray:
-    if sr == features.SR:
+def to_model_rate(wave: np.ndarray, sr: int, device="cuda", target: int = features.SR) -> np.ndarray:
+    if sr == target:
         return wave.astype(np.float32)
     import torchaudio
     x = torch.from_numpy(wave.astype(np.float32)).to(device)
-    return torchaudio.functional.resample(x, sr, features.SR).cpu().numpy()
+    return torchaudio.functional.resample(x, sr, target).cpu().numpy()
 
 
 def probabilities(kind: str, wave: np.ndarray, sr: int, device=None, with_features=False):
     """Per-frame model probabilities (T, outputs); with_features also returns the input features."""
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model, _ = load(kind, device)
-    feats = features.compute(to_model_rate(wave, sr, device), _meta[kind]["features"], device)
+    fkind = _meta[kind]["features"]
+    feats = features.compute(to_model_rate(wave, sr, device, features.rate(fkind)), fkind, device)
     prob = nn.predict(model, feats, device)
     return (prob, feats) if with_features else prob
 
