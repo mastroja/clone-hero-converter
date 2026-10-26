@@ -26,12 +26,13 @@ def _in(t, t0, t1):
 class Bank:
     """Memory-mapped features plus lazily built targets for a set of songs."""
 
-    def __init__(self, kind, items, path, n_out=None):
+    def __init__(self, kind, items, path, n_out=None, context=False):
         """path(i, song, kind) -> feature file."""
         self.kind, self.items = kind, items
         self.n_ch = n_out or len(cnn.CHANNELS[kind])
         self.n_lanes = cnn.n_lanes(kind)
         self.feats, self.stats, self.evs, self.attrs, self.dirs = {}, {}, {}, {}, {}
+        self.profiles = {}  # whole-song feature profile per song (models trained with --context)
         # converted five-lane drum charts always make blue a tom and yellow a cymbal, which real
         # pro-drum charts often don't: those songs teach kick, snare and timing, not cymbal vs tom
         self.no_cym_tom = {i for i, s in items if cnn.instrument(kind) == "drums" and s.get("five_lane")}
@@ -40,6 +41,10 @@ class Bank:
             self.feats[i] = f
             sample = np.asarray(f[:: max(1, len(f) // 400)], dtype=np.float32)
             self.stats[i] = (float(sample.mean()), float(sample.std() + 1e-6))
+            if context:
+                m_, sd_ = self.stats[i]
+                part = np.asarray(f[:: max(1, len(f) // 4000)], dtype=np.float32)
+                self.profiles[i] = features.song_profile((part - m_) / sd_)
             self.evs[i] = data.events(s, kind)
             if self.n_ch > self.n_lanes:
                 self.attrs[i] = data.attributes(s, kind)
@@ -78,7 +83,7 @@ class Bank:
         m = np.ones_like(y)  # which targets count towards the loss
         if i in self.no_cym_tom:
             m[:, 2:] = 0.0  # drums channels 2-7: yellow/blue/green, cymbal or tom
-        return x, y, m
+        return x, y, m, self.profiles.get(i, np.zeros(0, np.float32))
 
 
 def attribute_scores(probs, songs, kind):
@@ -165,6 +170,8 @@ def main():
     ap.add_argument("--data", choices=["v2", "v3"], default="v2")
     ap.add_argument("--dm-src", choices=["ft", "s6"], default="ft")
     ap.add_argument("--rel", action="store_true", help="also learn up/same/down fret moves")
+    ap.add_argument("--context", action="store_true",
+                    help="also give the model the whole song's feature profile (its pitch range)")
     ap.add_argument("--save-every", type=int, default=1000,
                     help="steps between resumable snapshots (also taken when paused)")
     args = ap.parse_args()
@@ -194,14 +201,14 @@ def main():
         n_out += len(cnn.REL)
     banks, weights = [], []
     if train_items:
-        banks.append(Bank(args.kind, train_items, layout.clean, n_out))
+        banks.append(Bank(args.kind, train_items, layout.clean, n_out, args.context))
         weights.append(1 - args.dm_frac if dm_items else 1.0)
     if dm_items and args.dm_frac > 0:
-        banks.append(Bank(args.kind, dm_items, layout.dm, n_out))
+        banks.append(Bank(args.kind, dm_items, layout.dm, n_out, args.context))
         weights.append(args.dm_frac if train_items else 1.0)
     weights = np.array(weights) / sum(weights)
     rng = np.random.default_rng(0)
-    model = cnn.NoteNet(args.kind, args.hidden, n_out).to(device)
+    model = cnn.NoteNet(args.kind, args.hidden, n_out, args.context).to(device)
     n_l = cnn.n_lanes(args.kind)
     print("params", sum(p.numel() for p in model.parameters()), flush=True)
     opt = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-2)
@@ -220,7 +227,8 @@ def main():
 
     def save(thr):
         torch.save({"state": model.state_dict(), "kind": args.kind, "thr": thr, "hidden": args.hidden,
-                    "n_out": n_out, "data": args.data, "dm_src": args.dm_src, "rel": args.rel}, out)
+                    "n_out": n_out, "data": args.data, "dm_src": args.dm_src, "rel": args.rel,
+                    "context": args.context}, out)
 
     # resumable snapshot: everything needed to carry on exactly where training stopped
     snap = out.with_name(out.stem + ".resume.pt")
@@ -244,13 +252,14 @@ def main():
 
     for step in range(start, args.steps + 1):
         model.train()
-        xs, ys, ms = zip(*(banks[rng.choice(len(banks), p=weights)].window(rng) for _ in range(args.batch)))
+        xs, ys, ms, ps = zip(*(banks[rng.choice(len(banks), p=weights)].window(rng) for _ in range(args.batch)))
         x = torch.from_numpy(np.stack(xs)).to(device)
         y = torch.from_numpy(np.stack(ys)).to(device)
         m = torch.from_numpy(np.stack(ms)).to(device)
+        prof = torch.from_numpy(np.stack(ps)).to(device) if args.context else None
         x = x + 0.05 * torch.randn_like(x)  # light noise augmentation
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss = lossf(model(x).float(), y, m)
+            loss = lossf(model(x, prof).float(), y, m)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         tnn.utils.clip_grad_norm_(model.parameters(), 1.0)
