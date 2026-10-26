@@ -34,19 +34,22 @@ const ICON = {
   library: P('<path d="M4 4h4v16H4zM10 4h4v16h-4z"/><path d="m16.5 4.5 3.8 1 -3.9 14.9-3.8-1z"/>'),
   settings: P('<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>'),
   upload: P('<path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/>'),
+  live: P('<path d="M9 18V5l11-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="17" cy="16" r="3"/>'),
   play: P('<path d="m7 4 13 8-13 8z"/>'),
   folder: P('<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>'),
   rocket: P('<path d="M5 15c-1.5 1.5-2 5-2 5s3.5-.5 5-2"/><path d="M14 4c3-1 6-1 6-1s0 3-1 6l-6 6-5-5z"/><path d="M9 10 5 9l-2 2 4 1M14 15l1 4 2-2-1-4"/>'),
 };
-const VIEWS = [["create", "Create"], ["queue", "Queue"], ["staging", "Staging"], ["library", "Library"], ["settings", "Settings"]];
+const VIEWS = [["create", "Create"], ["queue", "Queue"], ["staging", "Staging"], ["live", "Quickplay"], ["library", "Library"], ["settings", "Settings"]];
 
 // ---------- state + shell ----------
-const S = { settings: {}, jobs: [], status: {}, staging: null };
+const S = { settings: {}, jobs: [], status: {}, staging: null, me: { owner: true, name: "" } };
+const owner = () => S.me.owner;
+const byChip = (s) => s.added_by ? `<span class="chip by">from ${esc(s.added_by)}</span>` : "";
 const view = () => (location.hash.slice(1).split("?")[0] || "create");
 
 function navHTML(cls) {
   const active = S.jobs.filter((j) => j.status === "queued" || j.status === "running").length;
-  return VIEWS.map(([id, label]) =>
+  return VIEWS.filter(([id]) => owner() || id !== "library").map(([id, label]) =>
     `<button class="${cls}${view() === id ? " on" : ""}" data-go="${id}">${ICON[id]}<span>${label}</span>` +
     (id === "queue" && active ? `<span class="count">${active}</span>` : "") + `</button>`).join("");
 }
@@ -94,7 +97,7 @@ async function refresh() {
 function page(title, sub, body, actions = "") {
   $("#main").innerHTML = `<div class="top"><div><h1>${title}</h1>${sub ? `<p class="sub">${sub}</p>` : ""}</div><div class="row">${actions}</div></div>${body}`;
 }
-const render = () => ({ create: renderCreate, queue: renderQueue, staging: renderStaging, library: renderLibrary, settings: renderSettings }[view()] || renderCreate)();
+const render = () => ((!owner() && view() === "library" ? renderCreate : { create: renderCreate, queue: renderQueue, staging: renderStaging, live: renderLive, library: renderLibrary, settings: renderSettings }[view()]) || renderCreate)();
 
 // ---------- create ----------
 function namesFromFile(stem) {  // quick guess; the PC looks names up properly while converting
@@ -248,43 +251,80 @@ function renderQueue() {
       const v = j.result && j.result.verdict && VERDICT[j.result.verdict];
       return `<div class="card">
         <div class="row spread"><div class="grow"><b class="ellipsis" style="display:block">${esc(j.title)}</b>
-          <div class="faint">${j.kind === "update" ? "Updating chart · " : ""}${esc(step)}</div></div>
+          <div class="faint">${j.kind === "update" ? "Updating chart · " : ""}${esc(step)}${j.by ? ` · from ${esc(j.by)}` : ""}</div></div>
           <span class="chip ${cc}">${ct}</span></div>
         ${j.status === "running" || j.status === "queued" ? `<div class="bar" style="margin-top:12px"><i style="width:${Math.round(j.progress * 100)}%"></i></div>` : ""}
         <div class="row" style="margin-top:12px">
           ${v ? `<span class="chip ${v[0]}">${v[1]}</span>` : ""}<span class="grow"></span>
-          ${j.status === "running" || j.status === "queued" ? `<button class="btn small" data-cancel="${j.id}">Cancel</button>` : ""}
+          ${(j.status === "running" || j.status === "queued") && (owner() || j.by === S.me.name) ? `<button class="btn small" data-cancel="${j.id}">Cancel</button>` : ""}
           ${j.status === "done" ? `<button class="btn primary small" data-review="${esc(j.result.folder)}">Review</button>` : ""}
         </div></div>`;
     }).join("")}</div>` : `<div class="card empty">Nothing in the queue. Make a chart from the Create tab.</div>`,
-    jobs.some((j) => ["done", "failed", "cancelled"].includes(j.status)) ? `<button class="btn" id="clear">Clear finished</button>` : "");
+    owner() && jobs.some((j) => ["done", "failed", "cancelled"].includes(j.status)) ? `<button class="btn" id="clear">Clear finished</button>` : "");
   $$("[data-cancel]").forEach((b) => b.onclick = async () => { await post(`/api/jobs/${b.dataset.cancel}/cancel`); refresh(); });
   $$("[data-review]").forEach((b) => b.onclick = () => openReview(b.dataset.review));
   const c = $("#clear"); if (c) c.onclick = async () => { await post("/api/jobs/clear"); refresh().then(renderQueue); };
 }
 
+// ---------- sorting (shared by Staging and Quickplay) ----------
+const SORTS = [["artist", "Artist"], ["title", "Title"], ["album", "Album"], ["year", "Year"], ["recent", "Recently added"]];
+const sortKey = (v) => { try { return localStorage.getItem("sort_" + v) || "artist"; } catch (e) { return "artist"; } };
+const sortName = (t) => (t || "").replace(/^the\s+/i, "").toLowerCase();
+function sortSongs(list, key) {
+  const by = (f) => (a, b) => {
+    const x = f(a), y = f(b);
+    if (!x !== !y) return x ? -1 : 1;  // blanks last
+    return x < y ? -1 : x > y ? 1 : 0;
+  };
+  const t = by((s) => sortName(s.title || s.name)), ar = by((s) => sortName(s.artist));
+  const cmp = {
+    artist: (a, b) => ar(a, b) || t(a, b),
+    title: (a, b) => t(a, b) || ar(a, b),
+    album: (a, b) => by((s) => sortName(s.album))(a, b) || ar(a, b) || t(a, b),
+    year: (a, b) => by((s) => s.year)(a, b) || ar(a, b) || t(a, b),
+    recent: (a, b) => b.modified - a.modified,
+  }[key] || ((a, b) => ar(a, b) || t(a, b));
+  return [...list].sort(cmp);
+}
+const sortSelect = (v) => `<label class="sortsel faint">Sort <select data-sort="${v}">${SORTS.map(([k, l]) =>
+  `<option value="${k}" ${sortKey(v) === k ? "selected" : ""}>${l}</option>`).join("")}</select></label>`;
+function wireSort(v, redraw) {
+  const sel = $(`[data-sort="${v}"]`);
+  if (sel) sel.onchange = () => { try { localStorage.setItem("sort_" + v, sel.value); } catch (e) { /* not kept */ } redraw(); };
+}
+
 // ---------- staging ----------
 let stagingFilter = "all";
 const initials = (s) => (s || "?").split(/\s+/).slice(0, 2).map((w) => w[0]).join("").toUpperCase();
-const coverHTML = (s, cls = "cover") => s.has_cover
-  ? `<img class="${cls}" src="/api/cover?${qs({ folder: s.folder })}" alt="" loading="lazy">`
+const coverHTML = (s, cls = "cover", w = 300) => s.has_cover
+  ? `<img class="${cls}" src="/api/cover?${qs({ folder: s.folder, v: s.cover_v || 0, w })}" alt="" loading="lazy">`
   : `<div class="${cls} ph">${esc(initials(s.title || s.name))}</div>`;
 
 async function renderStaging(reviewAll = false) {
   page("Staging", "New charts land here first. Check them, then publish to your live library.",
     `<div class="empty"><span class="spinner"></span>${reviewAll ? "<div>Checking every song…</div>" : ""}</div>`,
-    `<button class="btn" id="checkall">Check all</button>`);
+    `${owner() ? `<button class="btn" id="fillcovers">Find missing covers</button> ` : ""}<button class="btn" id="checkall">Check all</button>`);
   $("#checkall").onclick = () => renderStaging(true);
+  if (owner()) $("#fillcovers").onclick = async (e) => {
+    const missing = (S.staging ? S.staging.songs : []).filter((x) => !x.has_cover).map((x) => x.folder);
+    if (!missing.length) { toast("Every song already has a cover"); return; }
+    e.target.disabled = true; e.target.textContent = `Finding ${missing.length} cover${missing.length === 1 ? "" : "s"}…`;
+    try {
+      const r = await post("/api/cover/fill", { folders: missing });
+      toast(`Added ${r.done.length} cover${r.done.length === 1 ? "" : "s"}` + (r.missed.length ? ` · no clear match for ${r.missed.length} (open the song to pick one)` : ""));
+    } catch (err) { toast(err.message); }
+    renderStaging();
+  };
   let r;
   try { r = await api("/api/staging?" + qs({ review_all: reviewAll })); } catch (e) { $("#main").innerHTML += `<p class="chip red">${esc(e.message)}</p>`; return; }
   S.staging = r;
-  const songs = r.songs.filter((s) => stagingFilter === "all" || (stagingFilter === "draft" ? s.status === "draft" : s.status === stagingFilter));
+  const songs = sortSongs(r.songs, sortKey("staging")).filter((s) => stagingFilter === "all" || (stagingFilter === "draft" ? s.status === "draft" : s.status === stagingFilter));
   const counts = { all: r.songs.length, draft: r.songs.filter((s) => s.status === "draft").length, reviewed: r.songs.filter((s) => s.status === "reviewed").length };
   $("#main").querySelector(".empty").outerHTML = `
     <div class="row spread wrap" style="margin-bottom:14px">
       <div class="tabs">${[["all", "All"], ["draft", "To review"], ["reviewed", "Reviewed"]].map(([k, l]) =>
         `<button class="${stagingFilter === k ? "on" : ""}" data-filter="${k}">${l} <span class="faint">${counts[k]}</span></button>`).join("")}</div>
-      <span class="faint ellipsis">${esc(r.folder)}</span>
+      <div class="row" style="gap:12px;min-width:0">${sortSelect("staging")}<span class="faint ellipsis">${esc(r.folder)}</span></div>
     </div>
     ${songs.length ? `<div class="songs">${songs.map((s) => {
       const v = s.verdict && VERDICT[s.verdict];
@@ -293,54 +333,116 @@ async function renderStaging(reviewAll = false) {
           <div class="faint ellipsis">${esc(s.artist || "Unknown artist")}</div>
           <div class="row wrap" style="margin-top:8px;gap:6px">
             ${v ? `<span class="chip ${v[0]}">${v[0] === "green" ? "✓" : v[0] === "yellow" ? "!" : "✕"} ${v[0] === "green" ? "OK" : v[0] === "yellow" ? "Check" : "Problems"}</span>` : `<span class="chip">Not checked</span>`}
-            ${s.status === "reviewed" ? `<span class="chip accent">Reviewed</span>` : ""}
+            ${s.status === "reviewed" ? `<span class="chip accent">Reviewed</span>` : ""}${byChip(s)}
           </div></div></div>`;
     }).join("")}</div>` : `<div class="card empty">No songs here yet.</div>`}`;
   $$("[data-filter]").forEach((b) => b.onclick = () => { stagingFilter = b.dataset.filter; renderStaging(); });
+  wireSort("staging", () => renderStaging());
   $$("[data-open]").forEach((c) => c.onclick = () => openReview(c.dataset.open));
 }
 
 function closeDrawer() { $$(".scrim, .drawer").forEach((e) => e.remove()); }
 
-async function openReview(folder) {
+async function openReview(folder, live = false) {
   closeDrawer();
   const scrim = document.createElement("div"); scrim.className = "scrim"; scrim.onclick = closeDrawer;
   const dr = document.createElement("div"); dr.className = "drawer";
-  dr.innerHTML = `<div class="empty"><span class="spinner"></span><div>Checking the chart…</div></div>`;
+  dr.innerHTML = `<div class="empty"><span class="spinner"></span><div>${live ? "Loading…" : "Checking the chart…"}</div></div>`;
   document.body.append(scrim, dr);
   let s;
-  try { s = await api("/api/staging/review?" + qs({ folder })); } catch (e) { dr.innerHTML = `<p class="chip red">${esc(e.message)}</p>`; return; }
-  const v = VERDICT[s.verdict];
+  try { s = await api(live ? "/api/live/song?" + qs({ folder }) : "/api/staging/review?" + qs({ folder })); }
+  catch (e) { dr.innerHTML = `<p class="chip red">${esc(e.message)}</p>`; return; }
+  const v = live ? null : VERDICT[s.verdict];
   const order = { red: 0, yellow: 1, info: 2 };
-  const findings = [...s.findings].sort((a, b) => order[a.level] - order[b.level]);
+  const findings = live ? [] : [...s.findings].sort((a, b) => order[a.level] - order[b.level]);
+  const editable = owner() && (!live || s.ours);  // human charts are only viewed, never changed
+  const stems = live ? s.stems.filter((k) => !/^(preview|crowd)/i.test(k)) : ["guitar", "bass", "drums", "vocals"].filter((k) => s.stems.includes(k));
   const local = S.settings.local;
   dr.innerHTML = `
-    <div class="row spread"><span class="faint">Review</span><button class="btn small" id="x">Close</button></div>
-    <div class="head" style="margin:14px 0 16px">${coverHTML(s, s.has_cover ? "" : "ph cover")}
+    <div class="row spread"><span class="faint">${live ? "Quickplay" : "Review"}</span><button class="btn small" id="x">Close</button></div>
+    <div class="head" style="margin:14px 0 16px">${coverHTML(s, s.has_cover ? "" : "ph cover", 0)}
       <div class="grow"><h2 style="margin:0">${esc(s.title || s.name)}</h2>
         <div class="muted">${esc(s.artist)}${s.album ? ` · ${esc(s.album)}` : ""}${s.year ? ` · ${esc(s.year)}` : ""}</div>
-        <div class="row wrap" style="margin-top:8px;gap:6px"><span class="chip ${v[0]}">${v[1]}</span>
-          <span class="chip">${esc(s.status)}</span></div>
+        <div class="row wrap" style="margin-top:8px;gap:6px">${live
+          ? (s.ours ? `<span class="chip accent">RockWizard</span>` : `<span class="chip">Human chart</span>`)
+          : `<span class="chip ${v[0]}">${v[1]}</span><span class="chip">${esc(s.status)}</span>`}${byChip(s)}</div>
         <div class="tiers" style="margin-top:8px">${["guitar", "bass", "drums"].map((k) => `<span>${k} <b>${esc(s.tiers[k] || "–")}</b></span>`).join("")}</div>
       </div></div>
-    <div class="card"><h2>Checks</h2>
-      ${findings.map((f) => `<div class="finding"><span class="lv ${f.level}"></span><div>${esc(f.text)}</div></div>`).join("")}</div>
+    <div class="card"><div class="row spread"><h2 style="margin:0">Song details</h2>${editable ? `<button class="btn small" id="editdet">Edit</button>` : ""}</div>
+      <div id="det" style="margin-top:10px">
+        <div class="kv">${[["Title", s.title], ["Artist", s.artist], ["Album", s.album], ["Year", s.year], ["Genre", s.genre], ["Charter", s.charter]]
+          .map(([k, val]) => `<span class="faint">${k}</span><span>${esc(val || "–")}</span>`).join("")}</div></div></div>
+    ${editable ? `<div class="card"><h2>Cover art</h2>
+      <div class="row wrap"><button class="btn" id="findcover">${s.has_cover ? "Change cover" : "Find cover art"}</button>
+        <button class="btn" id="upcover">Upload image</button><input type="file" id="coverfile" accept="image/*" hidden></div>
+      <div id="covers"></div></div>` : ""}
+    ${live ? "" : `<div class="card"><h2>Checks</h2>
+      ${findings.map((f) => `<div class="finding"><span class="lv ${f.level}"></span><div>${esc(f.text)}</div></div>`).join("")}</div>`}
     <div class="card"><h2>Listen</h2><div class="stems">
-      ${["guitar", "bass", "drums", "vocals"].filter((k) => s.stems.includes(k)).map((k) =>
+      ${stems.map((k) =>
         `<span>${k}</span><audio controls preload="none" src="/api/audio?${qs({ folder: s.folder, stem: k })}"></audio>`).join("")}</div></div>
-    <div class="card"><h2>Next</h2>
-      <div class="row wrap">
+    ${owner() ? `<div class="card"><h2>${live ? "Actions" : "Next"}</h2>
+      ${live ? (s.ours ? `<div class="row wrap"><button class="btn" id="unpub">Move back to staging</button></div>` : "") : `<div class="row wrap">
         <button class="btn primary" id="pub">${ICON.rocket} Publish to live</button>
         ${s.status !== "reviewed" ? `<button class="btn" id="rev">Mark reviewed</button>` : ""}
         <button class="btn" id="rechart">Re-chart</button>
-      </div>
+      </div>`}
       ${local ? `<div class="row wrap" style="margin-top:10px">
         <button class="btn small" data-open-pc="clonehero">${ICON.play} Play in Clone Hero</button>
         <button class="btn small" data-open-pc="moonscraper">Open in Moonscraper</button>
         <button class="btn small" data-open-pc="folder">${ICON.folder} Folder</button></div>` : ""}
-      <p class="faint" style="margin-bottom:0">Publishing moves the song into your live folder; Syncthing takes it to the Deck.</p>
-    </div>`;
+      <p class="faint" style="margin-bottom:0">${live ? (s.ours ? "Changes here reach the Deck with the next Syncthing sync." : "Human-made charts are view-only here, so they're never changed by accident.")
+        : "Publishing moves the song into your live folder; Syncthing takes it to the Deck."}</p>
+    </div>` : ""}`;
   $("#x", dr).onclick = closeDrawer;
+  const refreshAfter = (folder2) => { openReview(folder2, live); if (view() === "staging") renderStaging(); if (view() === "live") renderLive(); };
+  const unpub = $("#unpub", dr);
+  if (unpub) unpub.onclick = async () => {
+    if (!confirm("Move this song back to staging? It leaves your live library (and the Deck after the next sync).")) return;
+    try { await post("/api/live/unpublish", { folder: s.folder }); toast("Moved back to staging"); closeDrawer(); renderLive(); } catch (e) { toast(e.message); }
+  };
+  if (!editable) { if (owner()) wireOpenPC(dr, s); return; }
+  $("#editdet", dr).onclick = () => {
+    const f = (id, label, val, type = "text") => `<div><label class="field">${label}</label><input id="${id}" type="${type}" value="${esc(val || "")}"></div>`;
+    $("#det", dr).innerHTML = `<div class="form2">
+        ${f("d_name", "Title", s.title)}${f("d_artist", "Artist", s.artist)}${f("d_album", "Album", s.album)}
+        ${f("d_year", "Year", s.year)}${f("d_genre", "Genre", s.genre)}${f("d_charter", "Charter", s.charter)}</div>
+      <label class="item check" style="border:0;padding:10px 0 0"><input type="checkbox" id="d_rename" checked>
+        <div class="grow">Tidy it like Tidy names<div class="faint">Removes (…) and […] tags from the title and renames the folder “Artist - Song Title”</div></div></label>
+      <div class="row" style="margin-top:12px"><button class="btn primary" id="d_save">Save</button><button class="btn" id="d_cancel">Cancel</button></div>`;
+    $("#editdet", dr).remove();
+    $("#d_cancel", dr).onclick = () => openReview(s.folder, live);
+    $("#d_save", dr).onclick = async () => {
+      const fields = {}; ["name", "artist", "album", "year", "genre", "charter"].forEach((k) => fields[k] = $("#d_" + k, dr).value);
+      try { const r = await post("/api/song/details", { folder: s.folder, fields, rename: $("#d_rename", dr).checked }); toast("Saved to the song folder"); refreshAfter(r.folder); }
+      catch (e) { toast(e.message); }
+    };
+  };
+  $("#findcover", dr).onclick = async () => {
+    const box = $("#covers", dr);
+    box.innerHTML = `<div class="empty"><span class="spinner"></span></div>`;
+    try {
+      const r = await api("/api/cover/search?" + qs({ folder: s.folder }));
+      box.innerHTML = r.covers.length ? `<div class="covergrid">${r.covers.map((c, i) => `<button class="coverpick" data-i="${i}" title="${esc(c.album)}">
+          <img src="${esc(c.thumb)}" alt="" loading="lazy"><div class="ellipsis">${esc(c.album || "Unknown album")}</div>
+          <div class="faint ellipsis">${esc(c.year)} · ${esc(c.source)}${c.best ? " · best match" : ""}</div></button>`).join("")}</div>`
+        : `<p class="muted">No covers found. Check the artist and title in Song details, or upload an image.</p>`;
+      $$(".coverpick", box).forEach((b) => b.onclick = async () => {
+        b.disabled = true;
+        try { await post("/api/cover/set", { folder: s.folder, url: r.covers[b.dataset.i].url }); toast("Cover saved"); refreshAfter(s.folder); }
+        catch (e) { toast(e.message); b.disabled = false; }
+      });
+    } catch (e) { box.innerHTML = `<p class="chip red">${esc(e.message)}</p>`; }
+  };
+  $("#upcover", dr).onclick = () => $("#coverfile", dr).click();
+  $("#coverfile", dr).onchange = async (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    const fd = new FormData(); fd.append("folder", s.folder); fd.append("file", file);
+    try { await api("/api/cover/upload", { method: "POST", body: fd }); toast("Cover saved"); refreshAfter(s.folder); }
+    catch (err) { toast(err.message); }
+  };
+  wireOpenPC(dr, s);
+  if (live) return;
   $("#pub", dr).onclick = async () => {
     let r = await post("/api/staging/publish", { folder: s.folder });
     if (!r.ok && confirm(`${r.message}.\n\nPublish anyway?`)) r = await post("/api/staging/publish", { folder: s.folder, force: true });
@@ -350,9 +452,49 @@ async function openReview(folder) {
   const rev = $("#rev", dr);
   if (rev) rev.onclick = async () => { await post("/api/staging/status", { folder: s.folder, status: "reviewed" }); toast("Marked as reviewed"); openReview(folder); if (view() === "staging") renderStaging(); };
   $("#rechart", dr).onclick = async () => { await post("/api/jobs/update", { folders: [s.folder] }); toast("Re-charting with the newest models"); closeDrawer(); location.hash = "queue"; };
+}
+
+function wireOpenPC(dr, s) {
   $$("[data-open-pc]", dr).forEach((b) => b.onclick = async () => {
     try { await post("/api/open", { what: b.dataset.openPc, folder: s.folder }); } catch (e) { toast(e.message); }
   });
+}
+
+// ---------- live library (Quickplay) ----------
+let liveFilter = "all", liveQuery = "", liveShown = 120;
+async function renderLive() {
+  page("Quickplay", "Your live library: everything here syncs to the Deck.",
+    `<div class="empty"><span class="spinner"></span></div>`);
+  let r;
+  try { r = await api("/api/live"); } catch (e) { $("#main").innerHTML += `<p class="chip red">${esc(e.message)}</p>`; return; }
+  S.live = r;
+  $("#main").querySelector(".empty").outerHTML = `
+    <div class="row wrap" style="margin-bottom:14px;gap:10px">
+      <input id="lq" type="search" class="grow" placeholder="Search ${r.songs.length} songs by title, artist or album" value="${esc(liveQuery)}" style="min-width:200px">
+      <div class="tabs">${[["all", "All"], ["ours", "RockWizard"], ["human", "Human charts"], ["nocover", "No cover"]].map(([k, l]) =>
+        `<button class="${liveFilter === k ? "on" : ""}" data-lf="${k}">${l}</button>`).join("")}</div>
+      ${sortSelect("live")}
+    </div>
+    <div id="livegrid"></div>`;
+  const draw = () => {
+    const q = liveQuery.toLowerCase().trim();
+    const songs = sortSongs(r.songs, sortKey("live")).filter((s) => (liveFilter === "all" || (liveFilter === "ours" ? s.ours : liveFilter === "human" ? !s.ours : !s.has_cover))
+      && (!q || `${s.title} ${s.artist} ${s.album} ${s.name}`.toLowerCase().includes(q)));
+    $("#livegrid").innerHTML = songs.length ? `<div class="faint" style="margin-bottom:10px">${songs.length} song${songs.length === 1 ? "" : "s"}</div>
+      <div class="songs">${songs.slice(0, liveShown).map((s) => `<div class="song" data-live="${esc(s.folder)}">${coverHTML(s)}
+        <div class="meta"><div class="t ellipsis">${esc(s.title || s.name)}</div>
+          <div class="faint ellipsis">${esc(s.artist || "Unknown artist")}</div>
+          ${s.ours || s.added_by ? `<div class="row wrap" style="margin-top:8px;gap:6px">${s.ours ? `<span class="chip accent">RockWizard</span>` : ""}${byChip(s)}</div>` : ""}</div></div>`).join("")}</div>
+      ${songs.length > liveShown ? `<div style="text-align:center;margin:18px 0"><button class="btn" id="more">Show more (${songs.length - liveShown} left)</button></div>` : ""}`
+      : `<div class="card empty">No songs match.</div>`;
+    $$("[data-live]").forEach((c) => c.onclick = () => openReview(c.dataset.live, true));
+    const m = $("#more"); if (m) m.onclick = () => { liveShown += 120; draw(); };
+  };
+  let t;
+  $("#lq").oninput = (e) => { clearTimeout(t); t = setTimeout(() => { liveQuery = e.target.value; liveShown = 120; draw(); }, 150); };
+  $$("[data-lf]").forEach((b) => b.onclick = () => { liveFilter = b.dataset.lf; liveShown = 120; $$("[data-lf]").forEach((x) => x.classList.toggle("on", x === b)); draw(); });
+  wireSort("live", () => { liveShown = 120; draw(); });
+  draw();
 }
 
 // ---------- library ----------
@@ -455,6 +597,12 @@ function libDupes() {
 
 // ---------- settings ----------
 async function renderSettings() {
+  if (!owner()) {
+    page("Settings", "", `<div class="card"><h2>You</h2><p>You're using RockWizard as <b>${esc(S.me.name)}</b>.
+      Songs you add are marked as suggested by you.</p><button class="btn" id="rename">Change name</button></div>`);
+    $("#rename").onclick = async () => { await askName(true); renderNav(); render(); };
+    return;
+  }
   const st = S.settings, local = st.local;
   const field = (id, label, hint, kind = "folder") => `<div style="margin-top:14px"><label class="field">${label}</label>
     <div class="row"><input id="${id}" value="${esc(st[id] || "")}" class="grow">${desk() && kind ? `<button class="btn" data-pick="${id}" data-kind="${kind}">Browse</button>` : ""}</div>
@@ -488,6 +636,41 @@ async function renderSettings() {
        <div style="margin-top:10px"><button class="btn small" id="rescan">Sync now</button></div>`;
   const rs = $("#rescan"); if (rs) rs.onclick = async () => { try { await post("/api/sync/rescan"); toast("Syncthing is checking for changes"); } catch (e) { toast(e.message); } };
   if (!local) { $("#phone").innerHTML = `<h2>Use RockWizard on your phone</h2><p class="muted">This phone is paired. Tip: in Safari, Share → Add to Home Screen.</p>`; return; }
+  const devs = await api("/api/devices");
+  const ago = (t) => { const m = Math.round((Date.now() / 1000 - t) / 60); return m < 2 ? "now" : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} d ago`; };
+  $("#phone").insertAdjacentHTML("afterend", `<div class="card"><h2>Devices</h2>
+    <p class="muted" style="margin-top:0">Phones and browsers that have opened RockWizard. Yours can do everything; friends can add songs, look and listen, and their songs are marked with their name.</p>
+    ${devs.length ? devs.map((d) => `<div class="item"><div class="grow"><b>${esc(d.name || "No name yet")}</b>${d.this ? ` <span class="faint">(this one)</span>` : ""}
+        <div class="faint">${esc(d.kind)} · last seen ${ago(d.last)}</div></div>
+        <label class="row faint" style="gap:6px;white-space:nowrap"><input type="checkbox" data-mine="${d.id}" ${d.owner ? "checked" : ""}> Mine</label>
+        <button class="btn small" data-forget="${d.id}">Forget</button></div>`).join("")
+      : `<div class="empty">No phones yet. Scan the QR code above.</div>`}</div>`);
+  $$("[data-mine]").forEach((c) => c.onchange = async () => { await post(`/api/devices/${c.dataset.mine}`, { owner: c.checked }); toast(c.checked ? "Marked as yours" : "Now treated as a friend's device"); });
+  $$("[data-forget]").forEach((b) => b.onclick = async () => {
+    if (!confirm("Forget this device? It stays connected, but asks for a name again next time.")) return;
+    await api(`/api/devices/${b.dataset.forget}`, { method: "DELETE" }); renderSettings();
+  });
+  const su = await api("/api/startup");
+  if (desk()) {
+    $("#phone").insertAdjacentHTML("beforebegin", `<div class="card"><h2>Server</h2>
+      <div class="row wrap" style="gap:12px"><div class="grow"><span class="chip green">Running</span>
+        <span class="muted" style="margin-left:6px">RockWizard's background server, which also lets your phone connect.</span></div>
+        <button class="btn" id="stopsrv">Stop server</button></div></div>`);
+    $("#stopsrv").onclick = async () => {
+      const busy = S.status.busy || S.status.queued;
+      if (!confirm(busy ? "A conversion is still running. Stopping the server cancels it. Stop anyway?"
+                        : "Stop the server? Your phone won't be able to connect until you start it again.")) return;
+      await post("/api/server/stop");
+      desk().server_stopped();
+    };
+  }
+  $("#phone").insertAdjacentHTML("beforebegin", `<div class="card"><h2>Start with Windows</h2>
+    <label class="item check" style="border:0;padding:0"><input type="checkbox" id="startup" ${su.enabled ? "checked" : ""}>
+      <div class="grow">Run RockWizard in the background when you sign in<div class="faint">So your phone can always reach it while the PC is on. No window opens; the desktop app uses the same server.</div></div></label></div>`);
+  $("#startup").onchange = async (e) => {
+    try { const r = await post("/api/startup", { enabled: e.target.checked }); e.target.checked = r.enabled; toast(r.enabled ? "RockWizard will start when you sign in" : "RockWizard won't start with Windows"); }
+    catch (err) { e.target.checked = !e.target.checked; toast(err.message); }
+  };
   const p = await api("/api/pairing");
   $("#phone").innerHTML = `<h2>Use RockWizard on your phone</h2>
     <div class="row wrap" style="align-items:flex-start;gap:20px">
@@ -500,9 +683,32 @@ async function renderSettings() {
   $("#newkey").onclick = async () => { if (confirm("Make a new key? Phones paired before will need to scan again.")) { await post("/api/pairing/reset"); renderSettings(); } };
 }
 
+// ---------- who's using the app ----------
+function askName(again = false) {
+  return new Promise((done) => {
+    const scrim = document.createElement("div"); scrim.className = "scrim";
+    const m = document.createElement("div"); m.className = "modal card";
+    m.innerHTML = `<h2 style="margin-top:0">${again ? "Change your name" : "Welcome to RockWizard!"}</h2>
+      <p class="muted">${again ? "" : "What's your name? Songs you add get your name on them, so everyone knows who suggested them."}</p>
+      <input id="myname" type="text" maxlength="40" placeholder="Your name" value="${esc(again ? S.me.name : "")}" style="width:100%">
+      <div class="row" style="margin-top:14px;justify-content:flex-end">${again ? `<button class="btn" id="nmcancel">Cancel</button>` : ""}
+        <button class="btn primary" id="nmok">${again ? "Save" : "Let's go"}</button></div>`;
+    document.body.append(scrim, m);
+    const inp = $("#myname", m); inp.focus();
+    const close = () => { scrim.remove(); m.remove(); done(); };
+    const save = async () => {
+      try { S.me = await post("/api/me", { name: inp.value }); close(); } catch (e) { toast(e.message); }
+    };
+    $("#nmok", m).onclick = save;
+    inp.onkeydown = (e) => { if (e.key === "Enter") save(); };
+    const c = $("#nmcancel", m); if (c) c.onclick = close;
+  });
+}
+
 // ---------- start ----------
 (async () => {
-  try { S.settings = await api("/api/settings"); } catch (e) { $("#main").innerHTML = `<div class="card empty">${esc(e.message)}</div>`; return; }
+  try { S.settings = await api("/api/settings"); S.me = await api("/api/me"); } catch (e) { $("#main").innerHTML = `<div class="card empty">${esc(e.message)}</div>`; return; }
+  if (!S.me.owner && !S.me.name) await askName();
   renderNav(); render(); refresh();
   setInterval(refresh, 1500);
   const h = location.hash.slice(1);

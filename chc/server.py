@@ -4,11 +4,12 @@ Runs on this PC (its GPU does the work). Requests from this PC are always allowe
 devices (a phone over the home network or Tailscale) only with the pairing key, which the phone
 gets once from the QR code / link in Settings and then keeps as a cookie.
 
-    python -m chc.server            (http://127.0.0.1:8765; the desktop app starts it itself)
+    python -m chc.server            (http://127.0.0.1:8765; the desktop app starts it itself, see rockwizard_server.pyw)
 """
 import json
 import os
 import queue
+import re
 import secrets
 import shutil
 import subprocess
@@ -25,7 +26,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import library, pipeline, review, search, tidy
+from . import library, pipeline, review, search, startup, tidy
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB = ROOT / "web"
@@ -98,6 +99,7 @@ class Job:
     result: dict = field(default_factory=dict)
     created: float = field(default_factory=time.time)
     args: dict = field(default_factory=dict)
+    by: str = ""              # name of the friend who added it ("" for the owner)
 
 
 jobs: dict[str, Job] = {}
@@ -106,8 +108,8 @@ stops: dict[str, threading.Event] = {}
 CONVERT_STEPS = ["Downloading the song"] + pipeline.STEPS
 
 
-def add_job(kind, title, steps, **args) -> Job:
-    j = Job(uuid.uuid4().hex[:10], kind, title, steps, args=args)
+def add_job(kind, title, steps, by="", **args) -> Job:
+    j = Job(uuid.uuid4().hex[:10], kind, title, steps, args=args, by=by)
     jobs[j.id] = j
     stops[j.id] = threading.Event()
     job_queue.put(j.id)
@@ -146,6 +148,8 @@ def run_convert(j: Job, stop: threading.Event):
                                  on_step=on_step, on_progress=on_progress, stop=stop,
                                  details=details, cover=cover)
         shutil.rmtree(res.preview_dir, ignore_errors=True)
+        if j.by:  # shows on Clone Hero's loading screen, and in RockWizard
+            tidy.write_ini(res.song_dir, {"chc_added_by": j.by, "loading_phrase": f"Suggested by {j.by}"})
         rep = review.check(res.song_dir, live_dir())
         j.result = {"folder": str(res.song_dir), "counts": res.counts, "verdict": rep.verdict,
                     "replaced": [str(p) for p in res.replaced]}
@@ -182,6 +186,67 @@ def worker():
 threading.Thread(target=worker, daemon=True).start()
 
 
+# ---------- devices ----------
+# Every phone/browser gets its own id cookie (rw_dev). The owner's devices (and this PC) act as the
+# owner; anyone else is asked their name once, and songs they add are tagged with it.
+DEVICE_COOKIE = "rw_dev"
+_devices_lock = threading.Lock()
+
+
+def devices() -> dict:
+    return cfg.setdefault("devices", {})
+
+
+def device_of(request: Request) -> dict | None:
+    """The device record for this request; None on the PC itself (always the owner)."""
+    return getattr(request.state, "device", None)
+
+
+def is_owner(request: Request) -> bool:
+    d = device_of(request)
+    return d is None or bool(d.get("owner"))
+
+
+def added_by(request: Request) -> str:
+    """The friend's name to tag new songs with, or "" for the owner."""
+    d = device_of(request)
+    return "" if d is None or d.get("owner") else (d.get("name") or "a friend")
+
+
+def require_owner(request: Request):
+    if not is_owner(request):
+        raise HTTPException(403, "Only RockWizard's owner can do that")
+
+
+def _track_device(request: Request) -> tuple[dict, str | None]:
+    """Find or make this browser's device record; returns (record, new cookie id or None)."""
+    did = request.cookies.get(DEVICE_COOKIE, "")
+    now = time.time()
+    with _devices_lock:
+        devs = devices()
+        if did in devs:
+            d = devs[did]
+            if now - d.get("last", 0) > 60:
+                d["last"] = now
+                save_config(cfg)
+            return d, None
+        if request.url.path != "/":
+            # only the page itself registers a device: a phone's first page load fires several
+            # requests at once, which would otherwise each make their own record
+            return {"name": "", "owner": False, "kind": ""}, None
+        did = secrets.token_urlsafe(12)
+        agent = request.headers.get("user-agent", "")
+        kind = "iPhone" if "iPhone" in agent else "iPad" if "iPad" in agent else "Android" if "Android" in agent \
+            else "Mac" if "Macintosh" in agent else "Windows" if "Windows" in agent else "Browser"
+        # the phone that was already paired before devices were tracked is the owner's
+        paired_before = request.cookies.get("rw_key") == cfg["pair_key"] and not request.query_params.get("key")
+        first_owner = paired_before and not any(x.get("owner") for x in devs.values())
+        devs[did] = d = {"name": cfg.get("charter", "") if first_owner else "", "owner": first_owner,
+                         "kind": kind, "first": now, "last": now}
+        save_config(cfg)
+        return d, did
+
+
 # ---------- app + access ----------
 app = FastAPI(title="RockWizard")
 
@@ -198,10 +263,69 @@ async def access(request: Request, call_next):
         return HTMLResponse("<h2 style='font-family:system-ui;padding:24px'>RockWizard: this device isn't paired."
                             "<br>Open Settings &rarr; Phone in RockWizard on your PC and scan the QR code.</h2>",
                             status_code=401)
+    new_id = None
+    if not local:
+        request.state.device, new_id = _track_device(request)
     response = await call_next(request)
     if not local and request.query_params.get("key") == cfg["pair_key"]:
         response.set_cookie("rw_key", cfg["pair_key"], max_age=10 * 365 * 86400, samesite="lax")
+    if new_id:
+        response.set_cookie(DEVICE_COOKIE, new_id, max_age=10 * 365 * 86400, samesite="lax")
     return response
+
+
+@app.get("/api/me")
+def me(request: Request):
+    d = device_of(request)
+    return {"local": d is None, "owner": is_owner(request), "name": cfg.get("charter", "") if d is None else d.get("name", "")}
+
+
+@app.post("/api/me")
+async def set_me(request: Request):
+    d = device_of(request)
+    if d is None:
+        raise HTTPException(400, "This PC is the owner's")
+    name = " ".join(str((await request.json()).get("name", "")).split())[:40]
+    if not name:
+        raise HTTPException(400, "Please type your name")
+    d["name"] = name
+    # the owner's own name gives full rights on any device (it's among friends)
+    if name.lower() in {n.lower() for n in cfg.setdefault("owner_names", ["Jacob"])}:
+        d["owner"] = True
+    save_config(cfg)
+    return me(request)
+
+
+@app.get("/api/devices")
+def device_list(request: Request):
+    require_owner(request)
+    mine = request.cookies.get(DEVICE_COOKIE, "")
+    return [{"id": k, "this": k == mine and device_of(request) is not None, **v}
+            for k, v in sorted(devices().items(), key=lambda kv: -kv[1].get("last", 0))]
+
+
+@app.post("/api/devices/{did}")
+async def device_set(did: str, request: Request):
+    require_owner(request)
+    b = await request.json()
+    d = devices().get(did) or {}
+    if not d:
+        raise HTTPException(404)
+    if "owner" in b:
+        d["owner"] = bool(b["owner"])
+    if "name" in b:
+        d["name"] = " ".join(str(b["name"]).split())[:40]
+    save_config(cfg)
+    return d
+
+
+@app.delete("/api/devices/{did}")
+def device_forget(did: str, request: Request):
+    """Forget a device: next time it's asked for a name again (it stays paired)."""
+    require_owner(request)
+    devices().pop(did, None)
+    save_config(cfg)
+    return {"ok": True}
 
 
 def body_folder(path: str, base: Path | None = None) -> Path:
@@ -218,12 +342,12 @@ def list_jobs():
 
 
 @app.post("/api/jobs/upload")
-async def job_upload(file: UploadFile = File(...), artist: str = Form(""), title: str = Form("")):
+async def job_upload(request: Request, file: UploadFile = File(...), artist: str = Form(""), title: str = Form("")):
     up = Path(tempfile.mkdtemp(prefix="rw_up_")) / Path(file.filename).name
     with open(up, "wb") as f:
         shutil.copyfileobj(file.file, f)
     a, t = search.names_from_file(up.stem)
-    j = add_job("convert", f"{artist or a} - {title or t}".strip(" -"), CONVERT_STEPS[1:],
+    j = add_job("convert", f"{artist or a} - {title or t}".strip(" -"), CONVERT_STEPS[1:], by=added_by(request),
                 path=str(up), artist=artist or a, title=title or t)
     return public(j)
 
@@ -240,18 +364,21 @@ async def job_convert(req: Request):
             except Exception:
                 pass
     else:
+        require_owner(req)  # converting a file already on the PC
         if not Path(b.get("path", "")).exists():
             raise HTTPException(404, "file not found")
         steps = CONVERT_STEPS[1:]
         if not b.get("title"):
             b["artist"], b["title"] = search.names_from_file(Path(b["path"]).stem)
     j = add_job("convert", f"{b.get('artist', '')} - {b.get('title', '')}".strip(" -") or "YouTube song",
-                steps, path=b.get("path"), url=b.get("url"), artist=b.get("artist", ""), title=b.get("title", ""))
+                steps, by=added_by(req), path=b.get("path"), url=b.get("url"), artist=b.get("artist", ""),
+                title=b.get("title", ""))
     return public(j)
 
 
 @app.post("/api/jobs/update")
 async def job_update(req: Request):
+    require_owner(req)
     b = await req.json()
     out = []
     for f in b.get("folders", []):
@@ -261,10 +388,12 @@ async def job_update(req: Request):
 
 
 @app.post("/api/jobs/{jid}/cancel")
-def job_cancel(jid: str):
+def job_cancel(jid: str, request: Request):
     j = jobs.get(jid)
     if not j:
         raise HTTPException(404)
+    if not is_owner(request) and j.by != added_by(request):
+        raise HTTPException(403, "You can only cancel songs you added")
     stops[jid].set()
     if j.status == "queued":
         j.status = "cancelled"
@@ -272,7 +401,8 @@ def job_cancel(jid: str):
 
 
 @app.post("/api/jobs/clear")
-def jobs_clear():
+def jobs_clear(request: Request):
+    require_owner(request)
     for jid in [k for k, j in jobs.items() if j.status in ("done", "failed", "cancelled")]:
         jobs.pop(jid, None)
     return {"ok": True}
@@ -307,8 +437,12 @@ def do_search(q: str):
 async def chart_download(req: Request):
     b = await req.json()
     c = search.Chart(b["name"], b["artist"], b.get("charter", "unknown"), b["md5"])
-    dest = live_dir() if b.get("to") == "live" and live_dir() else staging_dir()
-    return {"saved": str(search.download_chart(c, dest))}
+    by = added_by(req)
+    dest = live_dir() if b.get("to") == "live" and live_dir() and not by else staging_dir()
+    saved = search.download_chart(c, dest)
+    if by and saved and Path(saved).is_dir():
+        tidy.write_ini(Path(saved), {"chc_added_by": by})
+    return {"saved": str(saved)}
 
 
 # ---------- staging ----------
@@ -324,15 +458,18 @@ def review_dict(folder: Path) -> dict:
 
 
 def song_summary(folder: Path, with_review=False) -> dict:
-    ini = tidy.read_ini(folder)
+    # Clone Hero allows <color=...>/<b> tags in names; show the plain text
+    ini = {k: re.sub(r"</?[a-z]+(=[^>]*)?>", "", v, flags=re.I) for k, v in tidy.read_ini(folder).items()}
     r = _reviews.get(str(folder))
-    mtime = (folder / "notes.mid").stat().st_mtime if (folder / "notes.mid").exists() else 0
+    mtime = (folder / "notes.mid").stat().st_mtime if (folder / "notes.mid").exists() else folder.stat().st_mtime
     if with_review and (r is None or r.get("mtime") != mtime):
         r = review_dict(folder)
     return {"folder": str(folder), "name": folder.name, "artist": ini.get("artist", ""), "title": ini.get("name", ""),
             "album": ini.get("album", ""), "year": ini.get("year", ""), "status": review.status(folder),
             "tiers": {k: ini.get(f"diff_{k}", "") for k in ("guitar", "bass", "drums")},
             "has_cover": (folder / "album.jpg").exists() or (folder / "album.png").exists(),
+            "cover_v": max((int((folder / n).stat().st_mtime) for n in ("album.jpg", "album.png") if (folder / n).exists()), default=0),
+            "genre": ini.get("genre", ""), "charter": ini.get("charter", ""), "added_by": ini.get("chc_added_by", ""),
             "stems": [p.stem for p in folder.iterdir() if p.suffix.lower() in (".ogg", ".opus", ".mp3")],
             "modified": mtime, "verdict": r["verdict"] if r else None}
 
@@ -354,6 +491,7 @@ def staging_review(folder: str):
 
 @app.post("/api/staging/status")
 async def staging_status(req: Request):
+    require_owner(req)
     b = await req.json()
     review.set_status(body_folder(b["folder"]), b["status"])
     return {"ok": True}
@@ -361,6 +499,7 @@ async def staging_status(req: Request):
 
 @app.post("/api/staging/publish")
 async def staging_publish(req: Request):
+    require_owner(req)
     b = await req.json()
     if not live_dir():
         raise HTTPException(400, "Set the live folder (Quickplay) in Settings first")
@@ -371,6 +510,7 @@ async def staging_publish(req: Request):
 @app.post("/api/open")
 async def open_on_pc(req: Request):
     """Desktop helpers: open a folder, play in Clone Hero, open in Moonscraper (on this PC)."""
+    require_owner(req)
     b = await req.json()
     what, folder = b.get("what"), body_folder(b["folder"])
     if what == "folder":
@@ -391,6 +531,8 @@ async def open_on_pc(req: Request):
 @app.get("/api/audio")
 def stem_audio(folder: str, stem: str):
     f = body_folder(folder)
+    if not stem.replace("_", "").replace("-", "").isalnum():
+        raise HTTPException(400, "Bad stem name")
     for ext in (".ogg", ".opus", ".mp3"):
         p = f / f"{stem}{ext}"
         if p.exists():
@@ -398,24 +540,161 @@ def stem_audio(folder: str, stem: str):
     raise HTTPException(404)
 
 
+THUMBS = ROOT / ".cache" / "covers"
+
+
 @app.get("/api/cover")
-def cover(folder: str):
+def cover(folder: str, w: int = 0):
+    """The song's cover; w=… gives a small cached copy (many human charts ship multi-MB covers)."""
     f = body_folder(folder)
     for n in ("album.jpg", "album.png"):
-        if (f / n).exists():
-            return FileResponse(f / n)
+        src = f / n
+        if not src.exists():
+            continue
+        if not 0 < w <= 600:
+            return FileResponse(src, headers={"Cache-Control": "max-age=86400"})
+        import hashlib
+        st = src.stat()
+        thumb = THUMBS / (hashlib.sha1(f"{src}|{st.st_mtime_ns}|{st.st_size}|{w}".encode()).hexdigest() + ".jpg")
+        if not thumb.exists():
+            try:
+                from PIL import Image
+                THUMBS.mkdir(parents=True, exist_ok=True)
+                img = Image.open(src).convert("RGB")
+                img.thumbnail((w, w))
+                img.save(thumb, "JPEG", quality=85)
+            except Exception:
+                return FileResponse(src)
+        return FileResponse(thumb, headers={"Cache-Control": "max-age=86400"})
     raise HTTPException(404)
+
+
+def our_song(path: str) -> Path:
+    """A song folder RockWizard made: the only ones the app edits (human charts are never touched)."""
+    f = body_folder(path)
+    if not library.is_ours(f):
+        raise HTTPException(403, "Only songs RockWizard made can be edited here")
+    return f
+
+
+@app.get("/api/cover/search")
+def cover_search(folder: str = "", artist: str = "", title: str = ""):
+    if folder:
+        ini = tidy.read_ini(body_folder(folder))
+        artist, title = artist or ini.get("artist", ""), title or ini.get("name", "")
+    return {"covers": [asdict(c) for c in search.cover_candidates(artist, title)]}
+
+
+@app.post("/api/cover/set")
+async def cover_set(req: Request):
+    require_owner(req)
+    b = await req.json()
+    f = our_song(b["folder"])
+    try:
+        search.save_cover(b["url"], f)
+    except Exception as e:
+        raise HTTPException(400, f"Couldn't save the cover: {e}")
+    return song_summary(f)
+
+
+@app.post("/api/cover/upload")
+async def cover_upload(request: Request, folder: str = Form(...), file: UploadFile = File(...)):
+    require_owner(request)
+    f = our_song(folder)
+    try:
+        search.write_cover(await file.read(), f)
+    except Exception as e:
+        raise HTTPException(400, f"That file isn't an image Clone Hero can use ({e.__class__.__name__})")
+    return song_summary(f)
+
+
+@app.post("/api/cover/fill")
+async def cover_fill(req: Request):
+    """Give every listed song without a cover the best match, when the match is clear."""
+    require_owner(req)
+    done, missed = [], []
+    for path in (await req.json())["folders"]:
+        f = our_song(path)
+        if (f / "album.jpg").exists() or (f / "album.png").exists():
+            continue
+        ini = tidy.read_ini(f)
+        cs = search.cover_candidates(ini.get("artist", ""), ini.get("name", ""), n=1)
+        try:
+            if not cs or not ini.get("artist"):
+                raise ValueError("no clear match")
+            search.save_cover(cs[0].url, f)
+            done.append(f.name)
+        except Exception:
+            missed.append(f.name)
+    return {"done": done, "missed": missed}
+
+
+# ---------- live library (Quickplay) ----------
+@app.get("/api/live")
+def live_list():
+    root = live_dir()
+    if not root or not root.exists():
+        return {"folder": str(root or ""), "songs": []}
+    songs = [song_summary(p) | {"ours": library.is_ours(p)} for p in library.song_folders(root)]
+    songs.sort(key=lambda x: -x["modified"])
+    return {"folder": str(root), "songs": songs}
+
+
+@app.get("/api/live/song")
+def live_song(folder: str):
+    f = body_folder(folder)
+    return song_summary(f) | {"ours": library.is_ours(f)}
+
+
+@app.post("/api/live/unpublish")
+async def live_unpublish(req: Request):
+    """Move a RockWizard song from the live folder back to staging (Syncthing removes it from the Deck)."""
+    require_owner(req)
+    f = our_song((await req.json())["folder"])
+    dest = staging_dir() / f.name
+    if dest.exists():
+        raise HTTPException(409, f"“{f.name}” is already in staging")
+    review.set_status(f, "draft")
+    shutil.move(str(f), str(dest))
+    return {"folder": str(dest)}
+
+
+DETAIL_KEYS = ("name", "artist", "album", "year", "genre", "charter")
+
+
+@app.post("/api/song/details")
+async def song_details_set(req: Request):
+    """Edit song.ini details; rename=True then tidies the song the same way Tidy names does
+    (title without (…)/[…] tags, folder renamed 'Artist - Song Title')."""
+    require_owner(req)
+    b = await req.json()
+    f = our_song(b["folder"])
+    fields = {k: str(v).strip() for k, v in (b.get("fields") or {}).items() if k in DETAIL_KEYS}
+    if "name" in fields and not fields["name"]:
+        raise HTTPException(400, "The song title can't be empty")
+    tidy.write_ini(f, fields)
+    if b.get("rename"):
+        try:
+            new = tidy.tidy_one(f)
+        except FileExistsError as e:
+            raise HTTPException(409, f"Saved, but couldn't rename: “{e}” already exists")
+        if new != f:
+            _reviews.pop(str(f), None)
+            f = new
+    return song_summary(f)
 
 
 # ---------- library ----------
 @app.get("/api/library/ours")
-def library_ours(folder: str = ""):
+def library_ours(request: Request, folder: str = ""):
+    require_owner(request)
     root = Path(folder) if folder else staging_dir()
     return {"folder": str(root), "songs": [song_summary(p) for p in library.song_folders(root) if library.is_ours(p)]}
 
 
 @app.get("/api/library/batch")
-def library_batch(folder: str):
+def library_batch(request: Request, folder: str):
+    require_owner(request)
     root = body_folder(folder)
     have = {}
     if staging_dir().exists():
@@ -433,7 +712,8 @@ def library_batch(folder: str):
 
 
 @app.get("/api/tidy")
-def tidy_scan(folder: str, parens: bool = True, brackets: bool = True, ini: bool = True):
+def tidy_scan(request: Request, folder: str, parens: bool = True, brackets: bool = True, ini: bool = True):
+    require_owner(request)
     root = body_folder(folder)
     props = tidy.scan(root, parens, brackets, ini)
     return {"folder": str(root), "can_undo": tidy.can_undo(root),
@@ -443,6 +723,7 @@ def tidy_scan(folder: str, parens: bool = True, brackets: bool = True, ini: bool
 
 @app.post("/api/tidy/apply")
 async def tidy_apply(req: Request):
+    require_owner(req)
     b = await req.json()
     root = body_folder(b["folder"])
     chosen = set(b.get("paths", []))
@@ -455,13 +736,15 @@ async def tidy_apply(req: Request):
 
 @app.post("/api/tidy/undo")
 async def tidy_undo(req: Request):
+    require_owner(req)
     b = await req.json()
     n, errs = tidy.undo(body_folder(b["folder"]))
     return {"restored": n, "errors": errs}
 
 
 @app.get("/api/dupes")
-def dupes(folder: str):
+def dupes(request: Request, folder: str):
+    require_owner(request)
     root = body_folder(folder)
     groups = library.find_duplicates(root)
     return {"folder": str(root), "groups": [[{
@@ -472,6 +755,7 @@ def dupes(folder: str):
 
 @app.post("/api/dupes/remove")
 async def dupes_remove(req: Request):
+    require_owner(req)
     b = await req.json()
     n, errs = library.recycle([Path(p) for p in b.get("paths", []) if Path(p).exists()])
     return {"removed": n, "errors": errs}
@@ -489,6 +773,7 @@ def get_settings(request: Request):
 
 @app.post("/api/settings")
 async def set_settings(req: Request):
+    require_owner(req)
     b = await req.json()
     for k in SETTING_KEYS:
         if k in b:
@@ -497,8 +782,24 @@ async def set_settings(req: Request):
     return {k: cfg.get(k, "") for k in SETTING_KEYS}
 
 
+@app.get("/api/startup")
+def get_startup():
+    return {"enabled": startup.enabled()}
+
+
+@app.post("/api/startup")
+async def set_startup(req: Request):
+    require_owner(req)
+    if (await req.json()).get("enabled"):
+        startup.enable()
+    else:
+        startup.disable()
+    return {"enabled": startup.enabled()}
+
+
 @app.post("/api/downloader/update")
-def downloader_update():
+def downloader_update(request: Request):
+    require_owner(request)
     return {"message": search.update_downloader()}
 
 
@@ -517,7 +818,8 @@ def lan_addresses() -> list[str]:
 
 
 @app.get("/api/pairing")
-def pairing():
+def pairing(request: Request):
+    require_owner(request)
     import io
     import qrcode
     import qrcode.image.svg
@@ -531,7 +833,8 @@ def pairing():
 
 
 @app.post("/api/pairing/reset")
-def pairing_reset():
+def pairing_reset(request: Request):
+    require_owner(request)
     cfg["pair_key"] = secrets.token_urlsafe(16)
     save_config(cfg)
     return pairing()
@@ -572,7 +875,8 @@ def syncthing_status() -> dict | None:
 
 
 @app.post("/api/sync/rescan")
-def sync_rescan():
+def sync_rescan(request: Request):
+    require_owner(request)
     conf = Path(os.environ.get("LOCALAPPDATA", "")) / "Syncthing" / "config.xml"
     try:
         import urllib.request
@@ -622,9 +926,25 @@ def manifest():
 app.mount("/static", StaticFiles(directory=WEB), name="static")
 
 
+_uvicorn = None  # the running uvicorn.Server, so /api/server/stop can end it cleanly
+
+
+@app.post("/api/server/stop")
+def server_stop(request: Request):
+    """Stop the server (only from this PC: a phone couldn't start it again). Any running job ends too."""
+    if not request.client or request.client.host not in ("127.0.0.1", "::1"):
+        raise HTTPException(403, "The server can only be stopped from the PC")
+    if _uvicorn is None:
+        raise HTTPException(400, "This server wasn't started by RockWizard")
+    threading.Timer(0.3, lambda: setattr(_uvicorn, "should_exit", True)).start()
+    return {"stopping": True}
+
+
 def serve(host="0.0.0.0", port=PORT):
+    global _uvicorn
     import uvicorn
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    _uvicorn = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="warning"))
+    _uvicorn.run()
 
 
 if __name__ == "__main__":

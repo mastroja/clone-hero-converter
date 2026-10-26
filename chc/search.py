@@ -250,6 +250,92 @@ def cover_art(details: Details, dest: Path) -> Path | None:
         return None
 
 
+@dataclass
+class Cover:
+    url: str
+    thumb: str
+    album: str
+    artist: str
+    year: str = ""
+    source: str = ""
+    best: bool = False
+
+
+COVER_HOSTS = ("mzstatic.com", "coverartarchive.org", "archive.org")  # where save_cover may download from
+
+
+def cover_candidates(artist: str, title: str, n: int = 8) -> list[Cover]:
+    """Album covers for a song, the likeliest first: Apple's iTunes catalogue (no key needed,
+    covers almost everything) and the MusicBrainz release this app uses for album/year.
+    MusicBrainz is slow (rate limited, several queries), so it runs alongside and gets a few seconds."""
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as Late
+    pool = ThreadPoolExecutor(1)
+    mb_job = pool.submit(lookup, artist, title)
+    pool.shutdown(wait=False)
+    try:
+        q = urllib.parse.urlencode({"term": f"{artist} {title}".strip(), "entity": "song", "limit": 25})
+        items = _json(f"https://itunes.apple.com/search?{q}").get("results", [])
+    except Exception:
+        items = []
+    want_t, want_a = normalize(title), normalize(artist)
+    seen = set()
+    scored = []
+    for it in items:
+        art = it.get("artworkUrl100") or ""
+        album = it.get("collectionName", "")
+        if not art or (album, it.get("artistName")) in seen:
+            continue
+        seen.add((album, it.get("artistName")))
+        score = similar(it.get("trackName", ""), title) + (similar(it.get("artistName", ""), artist) if artist else 0.5)
+        # the original album over compilations, live albums and deluxe repackages
+        if re.search(r"\b(greatest hits|best of|live|collection|essentials|hits)\b", album.lower()):
+            score -= 0.3
+        if normalize(it.get("trackName", "")) == want_t and (not want_a or normalize(it.get("artistName", "")) == want_a):
+            score += 0.5
+        scored.append((score, Cover(art.replace("100x100bb", "600x600bb"), art.replace("100x100bb", "200x200bb"),
+                                    album, it.get("artistName", ""), (it.get("releaseDate") or "")[:4], "iTunes")))
+    scored.sort(key=lambda s: -s[0])
+    out = [c for _, c in scored]
+    try:
+        d = mb_job.result(timeout=1.5 if scored and scored[0][0] >= 2.0 else 8)  # iTunes sure: barely wait
+    except Late:
+        d = None
+    if d and d.release_group:
+        base = f"https://coverartarchive.org/release-group/{d.release_group}/front"
+        mb = Cover(base + "-500", base + "-250", d.album, d.artist, d.year, "MusicBrainz")
+        # MusicBrainz picks the original studio album, so it goes first when iTunes isn't sure
+        if not scored or scored[0][0] < 2.0:
+            out.insert(0, mb)
+        else:
+            out.insert(1, mb)
+    if out:
+        out[0].best = True
+    return out[:n]
+
+
+def save_cover(url: str, folder: Path) -> Path:
+    """Download a cover from one of COVER_HOSTS into folder/album.jpg (at most 600 px); an
+    album.png is removed so Clone Hero shows the new one."""
+    host = urllib.parse.urlparse(url).hostname or ""
+    if not any(host == h or host.endswith("." + h) for h in COVER_HOSTS):
+        raise ValueError(f"Covers can't be downloaded from {host}")
+    with _request(url, timeout=20) as r:
+        data = r.read()
+    return write_cover(data, folder)
+
+
+def write_cover(data: bytes, folder: Path) -> Path:
+    """Save image bytes (any format Pillow reads) as folder/album.jpg, at most 600 px."""
+    import io
+    from PIL import Image
+    img = Image.open(io.BytesIO(data)).convert("RGB")
+    img.thumbnail((600, 600))
+    dest = Path(folder) / "album.jpg"
+    img.save(dest, "JPEG", quality=90)
+    (Path(folder) / "album.png").unlink(missing_ok=True)
+    return dest
+
+
 # ---------- YouTube (yt-dlp) ----------
 @dataclass
 class Video:

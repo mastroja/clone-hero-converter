@@ -1,0 +1,38 @@
+{
+  // Terminal > Run Task... (or Ctrl+Shift+P, "Tasks: Run Task")
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "RockWizard: open app",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv/Scripts/pythonw.exe",
+      "args": ["rockwizard.pyw"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "never" },
+      "problemMatcher": []
+    },
+    {
+      "label": "RockWizard: start background server",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv/Scripts/pythonw.exe",
+      "args": ["rockwizard_server.pyw"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "never" },
+      "problemMatcher": []
+    },
+    {
+      "label": "RockWizard: stop server",
+      "type": "shell",
+      "command": "Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction SilentlyContinue | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }; 'stopped'",
+      "options": { "shell": { "executable": "powershell.exe", "args": ["-NoProfile", "-Command"] } },
+      "problemMatcher": []
+    },
+    {
+      "label": "RockWizard: show server log",
+      "type": "shell",
+      "command": "Get-Content logs/rockwizard-server.log -Tail 40 -Wait",
+      "options": { "cwd": "${workspaceFolder}", "shell": { "executable": "powershell.exe", "args": ["-NoProfile", "-Command"] } },
+      "problemMatcher": []
+    }
+  ]
+}

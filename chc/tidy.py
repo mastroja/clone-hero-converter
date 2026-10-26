@@ -79,6 +79,30 @@ def is_song_folder(p: Path) -> bool:
     return p.is_dir() and any((p / m).exists() for m in SONG_MARKERS)
 
 
+def proposed_name(c: Path, parens: bool = True, brackets: bool = True, from_ini: bool = True) -> str:
+    """The tidy folder name for one song folder (the same rules as scan)."""
+    cleaned = clean_name(c.name, parens, brackets)
+    base = (ini_name(c) if from_ini else None) or cleaned
+    new = clean_name(base, parens, brackets)
+    if _key(new) == _key(cleaned):
+        new = cleaned  # same words: keep the folder's own spelling and capitals
+    # Windows forbids some characters, and trailing dots or spaces
+    return BAD_CHARS.sub("", new).rstrip(" .").strip() or c.name
+
+
+def tidy_one(folder: Path, parens: bool = True, brackets: bool = True) -> Path:
+    """Tidy a single song right away (after its details are edited): clean the title in
+    song.ini and rename the folder 'Artist - Song Title'. Raises FileExistsError if that
+    name is taken. Returns the folder's new path."""
+    _fix_ini(folder, parens, brackets)
+    target = folder.with_name(proposed_name(folder, parens, brackets))
+    if target != folder:
+        if target.exists() and target.resolve() != folder.resolve():
+            raise FileExistsError(target.name)
+        folder.rename(target)  # a case-only rename works on Windows too
+    return target
+
+
 def scan(root: Path, parens: bool = True, brackets: bool = True, from_ini: bool = True) -> list[Proposal]:
     """Find song folders under root whose names would change. from_ini names each song
     "Artist - Song Title" from its song.ini (when it has both); otherwise the folder name is
@@ -93,13 +117,7 @@ def scan(root: Path, parens: bool = True, brackets: bool = True, from_ini: bool 
             return
         for c in kids:
             if is_song_folder(c):
-                cleaned = clean_name(c.name, parens, brackets)
-                base = (ini_name(c) if from_ini else None) or cleaned
-                new = clean_name(base, parens, brackets)
-                if _key(new) == _key(cleaned):
-                    new = cleaned  # same words: keep the folder's own spelling and capitals
-                # Windows forbids some characters, and trailing dots or spaces
-                new = BAD_CHARS.sub("", new).rstrip(" .").strip() or c.name
+                new = proposed_name(c, parens, brackets, from_ini)
                 if new != c.name:
                     target = c.with_name(new)
                     note = ""
@@ -114,6 +132,25 @@ def scan(root: Path, parens: bool = True, brackets: bool = True, from_ini: bool 
                 walk(c)
     walk(root)
     return found
+
+
+def write_ini(folder: Path, fields: dict) -> None:
+    """Set song.ini keys (replacing existing lines, adding the rest under [song]); other lines kept."""
+    ini = folder / "song.ini"
+    try:
+        text = ini.read_text(encoding="utf-8-sig")
+    except OSError:
+        text = "[song]\n"
+    for key, value in fields.items():
+        value = " ".join(str(value).split())  # one line
+        pat = re.compile(rf"(?mi)^(\s*{re.escape(key)}\s*=).*$")
+        if pat.search(text):
+            text = pat.sub(lambda m: f"{m.group(1)} {value}", text, count=1)
+        elif re.search(r"(?mi)^\s*\[song\]\s*$", text):
+            text = re.sub(r"(?mi)^(\s*\[song\]\s*)$", lambda m: f"{m.group(1)}\n{key} = {value}", text, count=1)
+        else:
+            text = text.rstrip("\n") + f"\n{key} = {value}\n"
+    ini.write_text(text, encoding="utf-8")
 
 
 def _fix_ini(folder: Path, parens: bool, brackets: bool) -> None:

@@ -180,6 +180,9 @@ def update_song(song_dir: Path, on_step=lambda i: None, on_progress=lambda frac:
             preview = None
         write_chart(song_dir, c, ini.get("name", song_dir.name), ini.get("artist", ""),
                     ini.get("charter", ""), length, d, preview)
+        # fields write_chart doesn't write (review status, who added the song, ...) are kept
+        new = library.tidy.read_ini(song_dir)
+        library.tidy.write_ini(song_dir, {k: v for k, v in ini.items() if k not in new})
         on_progress(1.0)
         return saved
     finally:

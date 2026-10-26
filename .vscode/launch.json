@@ -1,0 +1,28 @@
+{
+  // Run and Debug panel (Ctrl+Shift+D): pick one and press F5
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "RockWizard app (window)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/rockwizard.pyw",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "cwd": "${workspaceFolder}",
+      "env": { "PYTHONIOENCODING": "utf-8" },
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "RockWizard server only (phone)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "chc.server",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "cwd": "${workspaceFolder}",
+      "env": { "PYTHONIOENCODING": "utf-8" },
+      "console": "integratedTerminal",
+      "justMyCode": true
+    }
+  ]
+}

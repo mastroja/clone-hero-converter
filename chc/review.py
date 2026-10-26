@@ -85,9 +85,12 @@ def check(folder: Path, live_dir: Path | None = None) -> Report:
     rep = Report(Path(folder))
     folder = Path(folder)
     ini = tidy.read_ini(folder)
-    for key in ("name", "artist"):
-        if not ini.get(key, "").strip():
-            rep.add("red", f"song.ini has no {key}")
+    if not ini.get("name", "").strip():
+        rep.add("red", "song.ini has no song title")
+    if not ini.get("artist", "").strip():
+        rep.add("yellow", "song.ini has no artist (the song still plays, but sorting and Tidy names need it)")
+    if not ((folder / "album.jpg").exists() or (folder / "album.png").exists()):
+        rep.add("info", "No album cover (Find cover art, below)")
     mid = folder / "notes.mid"
     if not mid.exists():
         rep.add("red", "No chart (notes.mid) in the folder")
@@ -113,10 +116,14 @@ def check(folder: Path, live_dir: Path | None = None) -> Report:
                 ", ".join(f"{n} {_clock(v)}" for n, v in lengths.items()))
 
     # tempo
-    bpms = [60e6 / t for t in tm.tempos]
+    # the first beat is only the lead-in (silence up to the first detected beat, no notes), so
+    # it can be any length without mattering in game; judge the tempos from the first beat on
+    ticks, bpms = list(tm.ticks), [60e6 / t for t in tm.tempos]
+    if len(bpms) > 1 and ticks[1] <= tpq:
+        ticks, bpms = ticks[1:], bpms[1:]
     if bpms and (min(bpms) < 30 or max(bpms) > 400):
         rep.add("red", f"Tempo out of range ({min(bpms):.0f}-{max(bpms):.0f} BPM)")
-    jumps = [sec(tk) for (tk, a, b) in zip(tm.ticks[1:], bpms, bpms[1:]) if max(a, b) / min(a, b) > 1.5]
+    jumps = [sec(tk) for (tk, a, b) in zip(ticks[1:], bpms, bpms[1:]) if max(a, b) / min(a, b) > 1.5]
     if jumps:
         rep.add("yellow", f"Tempo jumps sharply {len(jumps)} time{'s' if len(jumps) != 1 else ''}",
                 [(t, t + 2) for t in jumps[:10]])
