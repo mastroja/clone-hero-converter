@@ -31,7 +31,7 @@ class Bank:
         self.kind, self.items = kind, items
         self.n_ch = n_out or len(cnn.CHANNELS[kind])
         self.n_lanes = cnn.n_lanes(kind)
-        self.feats, self.stats, self.evs, self.attrs, self.dirs = {}, {}, {}, {}, {}
+        self.feats, self.stats, self.evs, self.attrs, self.dirs, self.sizes = {}, {}, {}, {}, {}, {}
         self.profiles = {}  # whole-song feature profile per song (models trained with --context)
         # converted five-lane drum charts always make blue a tom and yellow a cymbal, which real
         # pro-drum charts often don't: those songs teach kick, snare and timing, not cymbal vs tom
@@ -50,6 +50,8 @@ class Bank:
                 self.attrs[i] = data.attributes(s, kind)
             if self.n_ch > self.n_lanes + 2:
                 self.dirs[i] = data.directions(s, kind)
+            if self.n_ch > self.n_lanes + 5:
+                self.sizes[i] = data.chord_sizes(s, kind)
         # sample songs in proportion to their length
         self.w = np.array([len(self.feats[i]) for i, _ in items], float)
         self.w /= self.w.sum()
@@ -77,6 +79,9 @@ class Bank:
         if i in self.dirs:
             d = [(t - t0, c) for t, c in self.dirs[i] if _in(t, t0, t1)]
             y[:, nl + 2:nl + 5] = data.targets(d, len(x), 3)
+        if i in self.sizes:
+            z = [(t - t0, c) for t, c in self.sizes[i] if _in(t, t0, t1)]
+            y[:, nl + 5:nl + 8] = data.targets(z, len(x), 3)
         if len(x) < WIN:
             x = np.pad(x, ((0, WIN - len(x)), (0, 0)))
             y = np.pad(y, ((0, WIN - len(y)), (0, 0)))
@@ -87,14 +92,16 @@ class Bank:
 
 
 def attribute_scores(probs, songs, kind):
-    """Calls on the true notes: (hammer-on P/R/F1, sustain P/R/F1, direction accuracy or None)."""
+    """Calls on the true notes: (hammer-on P/R/F1, sustain P/R/F1, direction accuracy or None,
+    chord-size accuracy or None)."""
     h = [0, 0, 0]
     s = [0, 0, 0]
-    d_ok = d_n = 0
+    d_ok = d_n = z_ok = z_n = 0
     nl = cnn.n_lanes(kind)
     for p, song in zip(probs, songs):
         notes = song["notes"][data.base(kind)]
         dirs = dict(data.directions(song, kind)) if p.shape[1] >= nl + 5 else {}
+        sizes = dict(data.chord_sizes(song, kind)) if p.shape[1] >= nl + 8 else {}
         for n in notes:
             if len(n) < 4:
                 continue
@@ -113,7 +120,10 @@ def attribute_scores(probs, songs, kind):
             if n[0] in dirs:
                 d_n += 1
                 d_ok += int(np.argmax(p[max(0, fr - 2): fr + 3, nl + 2:nl + 5].max(axis=0))) == dirs[n[0]]
-    return data.prf(*h), data.prf(*s), (d_ok / d_n if d_n else None)
+            if n[0] in sizes:
+                z_n += 1
+                z_ok += int(np.argmax(p[max(0, fr - 2): fr + 3, nl + 5:nl + 8].max(axis=0))) == sizes[n[0]]
+    return data.prf(*h), data.prf(*s), (d_ok / d_n if d_n else None), (z_ok / z_n if z_n else None)
 
 
 def evaluate(model, items, kind, device, path, thresholds=None, grid=(0.2, 0.3, 0.4, 0.5, 0.6)):
@@ -170,6 +180,7 @@ def main():
     ap.add_argument("--data", choices=["v2", "v3"], default="v2")
     ap.add_argument("--dm-src", choices=["ft", "s6"], default="ft")
     ap.add_argument("--rel", action="store_true", help="also learn up/same/down fret moves")
+    ap.add_argument("--size", action="store_true", help="also learn how many frets each note has (needs --rel)")
     ap.add_argument("--context", action="store_true",
                     help="also give the model the whole song's feature profile (its pitch range)")
     ap.add_argument("--save-every", type=int, default=1000,
@@ -199,6 +210,10 @@ def main():
         if cnn.n_lanes(args.kind) == n_out:
             raise SystemExit("--rel is for guitar/bass")
         n_out += len(cnn.REL)
+    if args.size:
+        if not args.rel:
+            raise SystemExit("--size needs --rel (the outputs come after the direction ones)")
+        n_out += len(cnn.SIZE)
     banks, weights = [], []
     if train_items:
         banks.append(Bank(args.kind, train_items, layout.clean, n_out, args.context))
@@ -228,7 +243,7 @@ def main():
     def save(thr):
         torch.save({"state": model.state_dict(), "kind": args.kind, "thr": thr, "hidden": args.hidden,
                     "n_out": n_out, "data": args.data, "dm_src": args.dm_src, "rel": args.rel,
-                    "context": args.context}, out)
+                    "context": args.context, "size": args.size}, out)
 
     # resumable snapshot: everything needed to carry on exactly where training stopped
     snap = out.with_name(out.stem + ".resume.pt")
@@ -275,6 +290,8 @@ def main():
                 msg += f" | hopo F1 {attrs[0][2]:.3f} sustain F1 {attrs[1][2]:.3f}"
                 if attrs[2] is not None:
                     msg += f" | direction acc {attrs[2]:.3f}"
+                if attrs[3] is not None:
+                    msg += f" | chord size acc {attrs[3]:.3f}"
             print(msg, flush=True)
             if f > best_f:  # keep the best checkpoint, not just the last
                 best_f = f

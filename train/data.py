@@ -126,6 +126,11 @@ def directions(song: dict, kind: str):
     return out
 
 
+def chord_sizes(song: dict, kind: str):
+    """Guitar/bass -> [(time, 0 single note / 1 two frets / 2 three or more)]."""
+    return [(n[0], min(len(n[1]), 3) - 1) for n in song["notes"][base(kind)]]
+
+
 def feat_path(i: int, kind: str) -> Path:
     return Path("data/feats") / f"{i:04d}_{kind}.npy"
 

@@ -22,6 +22,9 @@ for _k in ("bass2", "bass_hr"):
 # optional extra outputs (train --rel): is this note's lowest fret above, equal to or below
 # the previous note's? Charters place frets by the melody's shape, not absolute pitch.
 REL = ["up", "same", "down"]
+# optional extra outputs after those (train --size): how many frets the note has (1, 2, 3+);
+# chord size was the biggest guitar error when chords were picked from the lane outputs alone
+SIZE = ["1 fret", "2 frets", "3 frets"]
 
 
 def instrument(kind: str) -> str:

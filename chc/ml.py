@@ -74,7 +74,7 @@ MIN_SUSTAIN = 0.30  # seconds; shorter held notes are charted as plain notes
 def decode_settings(kind: str) -> dict:
     """Decoding thresholds tuned on validation songs (train.calibrate), else defaults."""
     return {"thr": 0.35, "ratios": CHORD_RATIO[kind], "hopo": 0.5, "sus": 0.5, "rel": 1.0,
-            **_settings.get(kind, {})}
+            "size_bias": [1.0, 1.0], **_settings.get(kind, {})}
 
 
 def follow_directions(lanes, segs, rel_p, weight):
@@ -130,7 +130,8 @@ def fretted_notes(kind: str, wave: np.ndarray, sr: int, with_features=False):
     return (notes, feats) if with_features else notes
 
 
-def decode_fretted(kind: str, prob: np.ndarray, thr=0.35, ratios=None, hopo=0.5, sus=0.5, rel=1.0):
+def decode_fretted(kind: str, prob: np.ndarray, thr=0.35, ratios=None, hopo=0.5, sus=0.5, rel=1.0,
+                   size_bias=(1.0, 1.0)):
     """Model probabilities -> notes.
 
     Note times are peaks of the strongest lane probability. A second (third) lane joins
@@ -138,12 +139,17 @@ def decode_fretted(kind: str, prob: np.ndarray, thr=0.35, ratios=None, hopo=0.5,
     chords never exceed MAX_CHORD lanes. Models trained with the hammer-on/sustain outputs
     also give each note a sustain length and a hammer-on flag; older models give 0 / None.
     Models with up/same/down outputs then re-place frets along the melody (follow_directions).
+    Models with chord-size outputs choose how many frets each note gets from those instead
+    (size_bias scales the 2- and 3-fret chances, tuned so chords are as common as in real charts),
+    then take that many of the likeliest lanes.
     """
     ratios = ratios or CHORD_RATIO[kind]
     hopo_thr, sus_thr = hopo, sus
     lanes_p = prob[:, :5]
     has_attr = prob.shape[1] >= 7
     has_rel = prob.shape[1] >= 10
+    has_size = prob.shape[1] >= 13
+    bias = np.array([1.0, *size_bias])
     onset = lanes_p.max(axis=1, keepdims=True)
     frames = [fr for fr, _, _ in nn.pick(onset, thr)]
     out, segs, rels = [], [], []
@@ -153,12 +159,16 @@ def decode_fretted(kind: str, prob: np.ndarray, thr=0.35, ratios=None, hopo=0.5,
         if has_rel:
             rels.append(prob[max(0, fr - 2): fr + 3, 7:10].max(axis=0))
         order = np.argsort(-seg)
-        lanes = [int(order[0])]
-        for j in range(1, MAX_CHORD[kind]):
-            if seg[order[j]] >= max(0.3, ratios[j - 1] * seg[order[0]]):
-                lanes.append(int(order[j]))
-            else:
-                break
+        if has_size:
+            n = int(np.argmax(prob[max(0, fr - 2): fr + 3, 10:13].max(axis=0) * bias)) + 1
+            lanes = [int(l) for l in order[:min(n, MAX_CHORD[kind])]]
+        else:
+            lanes = [int(order[0])]
+            for j in range(1, MAX_CHORD[kind]):
+                if seg[order[j]] >= max(0.3, ratios[j - 1] * seg[order[0]]):
+                    lanes.append(int(order[j]))
+                else:
+                    break
         length, hopo = 0.0, None
         if has_attr:
             hopo = bool(prob[max(0, fr - 2): fr + 3, 5].max() > hopo_thr)
