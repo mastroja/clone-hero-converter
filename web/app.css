@@ -239,6 +239,8 @@ code { background: var(--bg2); padding: 2px 6px; border-radius: 6px; border: 1px
   .thumb { width: 74px; height: 42px; }
   .desktop-only { display: none !important; }
   .searchbox { flex-direction: column; }
+  /* 16px or more, or iPhones zoom the page when a field is tapped */
+  input, select, textarea { font-size: 16px !important; }
   .drawer { padding: 18px 16px calc(24px + env(safe-area-inset-bottom)); }
 }
 

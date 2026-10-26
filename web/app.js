@@ -53,9 +53,17 @@ function navHTML(cls) {
     `<button class="${cls}${view() === id ? " on" : ""}" data-go="${id}">${ICON[id]}<span>${label}</span>` +
     (id === "queue" && active ? `<span class="count">${active}</span>` : "") + `</button>`).join("");
 }
+// only touch the page when something changed: the status poll runs every 1.5 s, and rewriting
+// the tab bar under an open iPhone keyboard can knock the focus out of a text field
+const lastHTML = {};
+function setHTML(sel, html) {
+  if (lastHTML[sel] === html) return;
+  lastHTML[sel] = html;
+  $(sel).innerHTML = html;
+}
 function renderNav() {
-  $("#nav").innerHTML = navHTML("nav");
-  $("#tabbar").innerHTML = navHTML("");
+  setHTML("#nav", navHTML("nav"));
+  setHTML("#tabbar", navHTML(""));
 }
 document.addEventListener("click", (e) => {
   const go = e.target.closest("[data-go]");
@@ -79,9 +87,9 @@ function statusPills() {
       else pills.push(["busy", `${d.name}: syncing ${Math.floor(d.completion)}%`]);
     } else pills.push(["", `Sync: ${sy.state}`]);
   }
-  $("#pills").innerHTML = pills.map(([c, t]) => `<div class="pill"><span class="dot ${c}"></span><span>${esc(t)}</span></div>`).join("");
+  setHTML("#pills", pills.map(([c, t]) => `<div class="pill"><span class="dot ${c}"></span><span>${esc(t)}</span></div>`).join(""));
   const [c, t] = pills[0];
-  $("#mpill").innerHTML = `<span class="dot ${c}"></span><span>${esc(t)}</span>`;
+  setHTML("#mpill", `<span class="dot ${c}"></span><span>${esc(t)}</span>`);
 }
 
 async function refresh() {
@@ -140,7 +148,8 @@ function renderCreate() {
   drop.ondragleave = () => drop.classList.remove("over");
   drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove("over"); const f = e.dataTransfer.files[0]; if (f) pending(f); };
   $("#go").onclick = doSearch;
-  $("#q").onkeydown = (e) => e.key === "Enter" && doSearch();
+  // a block body: an on… handler that returns false throws the keystroke away
+  $("#q").onkeydown = (e) => { if (e.key === "Enter") doSearch(); };
   if (!desk()) $("#batchcard").classList.add("hidden");  // needs the desktop window's folder picker
   $("#pickbatch").onclick = pickBatch;
 }
