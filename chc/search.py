@@ -164,17 +164,25 @@ def song_details(artist: str, title: str) -> Details | None:
     """The song's original studio release: album, year, genre, length."""
     if not title:
         return None
-    base = f'recording:"{title}"' + (f' AND artist:"{artist}"' if artist else "")
-    recs = []
-    # official albums first (the original studio recording is usually among them), then anything
+    # 'The Black Cat Bones' is listed as 'Black Cat Bones' (and the other way round): try both
+    names = [artist] if artist else [""]
+    if artist.lower().startswith("the "):
+        names.append(artist[4:])
+    elif artist:
+        names.append("The " + artist)
     # studio albums first (no compilations, live albums, soundtracks...: classics have hundreds of
     # recordings and the original can otherwise fall outside the results), then official
     # albums, then anything
     studio = (" AND status:official AND primarytype:album AND NOT secondarytype:compilation"
               " AND NOT secondarytype:live AND NOT secondarytype:soundtrack AND NOT secondarytype:remix"
               " AND NOT secondarytype:demo")
-    for q in (base + studio, base + " AND status:official AND primarytype:album", base):
-        recs = _mb("recording", query=q, limit=50).get("recordings") or []
+    recs = []
+    for name in names:
+        base = f'recording:"{title}"' + (f' AND artist:"{name}"' if name else "")
+        for q in (base + studio, base + " AND status:official AND primarytype:album", base):
+            recs = _mb("recording", query=q, limit=50).get("recordings") or []
+            if recs:
+                break
         if recs:
             break
     best = None
@@ -185,11 +193,14 @@ def song_details(artist: str, title: str) -> Details | None:
         if name_s < 0.8 or art_s < 0.6:
             continue
         odd = any(w in (r.get("disambiguation") or "").lower() for w in ("live", "demo", "remix", "edit", "version"))
+        # '(Quadrophonic mix)', '(Remastered)'...: a variant unless the search asked for it
+        tagged = r.get("title", "").strip().lower() != title.strip().lower()
         first = r.get("first-release-date") or "9999"
         for rel in r.get("releases") or []:
             rg = rel.get("release-group") or {}
             # the earliest-released recording (the original), on an official studio album
-            rank = (odd, first, 0 if rel.get("status") == "Official" else 1,
+            rank = (artist and normalize(credit) != normalize(artist), odd, tagged, first,
+                    0 if rel.get("status") == "Official" else 1,
                     0 if rg.get("primary-type") == "Album" and not rg.get("secondary-types") else 1,
                     rel.get("date") or "9999")
             if best is None or rank < best[0]:
@@ -198,7 +209,10 @@ def song_details(artist: str, title: str) -> Details | None:
         return None
     _, r, rel, credit = best
     rg = rel.get("release-group") or {}
-    d = Details(r.get("title", title), credit or artist, rel.get("title", ""),
+    rec_title = r.get("title", title)
+    if "(" not in title and "[" not in title:
+        rec_title = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]\s*$", "", rec_title) or rec_title  # drop '(Quadrophonic mix)'
+    d = Details(rec_title, credit or artist, rel.get("title", ""),
                 (rel.get("date") or "")[:4], "", (r.get("length") or 0) / 1000.0, rg.get("id", ""))
     try:
         if d.release_group:
@@ -302,10 +316,24 @@ def clean_title(t: str) -> str:
     return " ".join(t.replace('"', "").split())
 
 
+def names_from_file(stem: str) -> tuple[str, str]:
+    """(artist, song) from an audio file name like 'Artist - Song - uploader (128k)'."""
+    from .tidy import clean_name
+    a, t = parse_query(stem.replace("_", " "))
+    a, t = (clean_name(a) if a else ""), clean_name(t)
+    parts = t.split(" - ")
+    # converters often append ' - uploader': drop a last part that is one word or ALL CAPS
+    if len(parts) > 1 and (" " not in parts[-1].strip() or parts[-1].isupper()):
+        t = " - ".join(parts[:-1])
+    return a, t
+
+
 def names_from_video(title: str, channel: str) -> tuple[str, str]:
     """(artist, song) guessed from a video's title and channel."""
     a, t = parse_query(clean_title(title))
     artist = channel.removesuffix(" - Topic").strip()
+    if a and artist and similar(t, artist) > 0.8 and similar(a, artist) < 0.5:
+        a, t = t, a  # 'Song - Artist' (reversed), told apart by the artist's own channel
     if not a and artist and normalize(t).startswith(normalize(artist) + " "):
         a, t = artist, t[len(artist):].strip(" -:")  # 'Band "Song"' from the band's own channel
     if not a and channel.endswith(" - Topic"):

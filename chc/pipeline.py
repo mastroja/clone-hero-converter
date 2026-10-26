@@ -8,7 +8,7 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import analysis, audio, chart, ml, structure
+from . import analysis, audio, chart, ml, rating, structure
 
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 STEM_TO_CH = {"other": "guitar", "bass": "bass", "drums": "drums", "vocals": "vocals"}
@@ -150,9 +150,13 @@ def make_song(src: Path, artist: str, title: str, songs_dir: Path, charter: str 
                                  guitar=gtimed, bass=btimed, drums=drum_timed, snap=snap,
                                  beatmap=beatmap)
         d = details
+        # each instrument's difficulty tier for the song list, judged from its Expert chart
+        tiers = {k: rating.tier(k, notes) for k, notes in
+                 (("guitar", gtimed), ("bass", btimed), ("drums", drum_timed)) if notes}
         chart.write_ini(song_dir / "song.ini", title, artist, charter, int(length * 1000), counts,
                         preview_ms=int(min(30, max(0, length - 40)) * 1000),
-                        album=d.album if d else "", genre=d.genre if d else "", year=d.year if d else "")
+                        album=d.album if d else "", genre=d.genre if d else "", year=d.year if d else "",
+                        tiers=tiers)
         if cover is not None and Path(cover).exists():
             shutil.copy(cover, song_dir / "album.jpg")
         for demucs_name, ch_name in STEM_TO_CH.items():

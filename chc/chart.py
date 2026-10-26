@@ -345,12 +345,18 @@ def write_mid(path: Path, bpm: float, offset: float, guitar=None, bass=None, dru
 
 
 def write_ini(path: Path, title: str, artist: str, charter: str, length_ms: int,
-              parts: dict, preview_ms: int = 0, album: str = "", genre: str = "", year: str = ""):
+              parts: dict, preview_ms: int = 0, album: str = "", genre: str = "", year: str = "",
+              tiers: dict | None = None):
+    """tiers: {"guitar": 0-6, ...} difficulty shown in the song list (chc.rating); 2 if unknown."""
+    tiers = tiers or {}
+
+    def diff(inst):
+        return tiers.get(inst, 2) if f"PART {inst.upper()}" in parts else -1
     lines = ["[song]", f"name = {title}", f"artist = {artist}", f"album = {album}",
              f"genre = {genre}", f"year = {year}",
-             f"charter = {charter}", f"diff_guitar = {2 if 'PART GUITAR' in parts else -1}",
-             f"diff_bass = {2 if 'PART BASS' in parts else -1}",
-             f"diff_drums = {2 if 'PART DRUMS' in parts else -1}",
+             f"charter = {charter}", f"diff_guitar = {diff('guitar')}",
+             f"diff_bass = {diff('bass')}",
+             f"diff_drums = {diff('drums')}",
              "pro_drums = True", f"song_length = {length_ms}", "delay = 0",
              f"preview_start_time = {preview_ms}"]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

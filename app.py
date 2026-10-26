@@ -23,6 +23,9 @@ except ImportError:  # non-Windows: previews disabled
 
 CONFIG = Path.home() / ".clone_hero_converter.json"
 AUDIO_EXT = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".opus", ".aac", ".wma"}
+# separated stems lying around in a folder are parts of a song, not songs to convert
+STEM_NAMES = {"bass", "drums", "other", "vocals", "guitar", "piano", "keys", "song", "crowd", "preview",
+              "rhythm", "drums_1", "drums_2", "drums_3", "drums_4", "no_vocals", "instrumental"}
 ACCENT = "#7c5cff"
 ACCENT_HOVER = "#6a49ec"
 GOOD = "#35c486"
@@ -50,6 +53,15 @@ def short(text: str, n: int = 52) -> str:
     return text if len(text) <= n else text[:n - 1].rstrip() + "…"
 
 
+def lookup_names(a: str, t: str):
+    """Song details for (artist, title), trying the swapped order too ('Song - Artist' names);
+    None when unknown or offline."""
+    try:
+        return search.song_details(a, t) or (search.song_details(t, a) if a else None)
+    except Exception:
+        return None
+
+
 def default_songs_dir() -> Path:
     return Path.home() / "Documents" / "Clone Hero" / "Songs"
 
@@ -64,7 +76,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.geometry("820x640")
         self.minsize(720, 580)
         self.cfg = load_config()
-        self.songs_dir = Path(self.cfg.get("songs_dir") or default_songs_dir())
+        self.songs_dir = Path(self.cfg.get("songs_dir") or default_songs_dir())  # where new songs go
+        self.tidy_dir = Path(self.cfg.get("tidy_dir") or self.songs_dir)        # which folder Tidy works on
         self.src: Path | None = None
         self.src_url: str | None = None   # a YouTube pick or pasted link, downloaded on "Make my song"
         self.details = None               # search.Details for song.ini, when known
@@ -104,6 +117,9 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         ctk.CTkButton(f, text="⚙  Settings", width=110, height=32, fg_color=CARD,
                       hover_color=CARD_HOVER, text_color=("#222", "#eee"),
                       command=self.show_settings).place(relx=1.0, y=4, anchor="ne")
+        ctk.CTkButton(f, text="Convert a folder...", width=150, height=32, fg_color=CARD,
+                      hover_color=CARD_HOVER, text_color=("#222", "#eee"),
+                      command=self.pick_batch_folder).place(relx=1.0, x=-120, y=4, anchor="ne")
         self.drop = ctk.CTkFrame(f, fg_color=CARD, corner_radius=18, border_width=2,
                                  border_color=ACCENT, height=190)
         self.drop.pack(fill="x")
@@ -177,7 +193,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         if getattr(self, "working", False) or not hasattr(self, "artist") or not self.artist.winfo_exists():
             return
         self.src, self.src_url, self.details = path, None, None
-        artist, title = pipeline.parse_name(path)
+        artist, title = search.names_from_file(path.stem)
         for entry, val in ((self.artist, artist), (self.title_e, title)):
             entry.delete(0, "end")
             entry.insert(0, val)
@@ -185,6 +201,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.drop_sub.configure(text="Ready. Check the names below, then press Make my song.")
         self.drop.configure(border_color=GOOD)
         self.go.configure(state="normal")
+        if title:
+            threading.Thread(target=self.confirm_names, args=(path, artist, title), daemon=True).start()
 
     def set_url(self, url: str, label: str, artist: str = "", title: str = ""):
         """Use a YouTube video as the song: it is downloaded when Make my song is pressed."""
@@ -322,11 +340,40 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         threading.Thread(target=run, daemon=True).start()
 
     def use_video(self, video, artist, title, details):
+        """Names come from the chosen video (cleaned), not from what was typed in the search box;
+        the looked-up song details are kept only if they are about the same song."""
+        va, vt = search.names_from_video(video.title, video.channel)
+        if details and search.similar(details.title, vt) >= 0.8 and \
+                (not va or search.similar(details.artist, va) >= 0.6):
+            va, vt = details.artist, details.title  # same song: use the proper spelling
+        else:
+            details = None  # details were for a different song; look them up again when making it
         self.details = details
-        artist = (details.artist if details else "") or artist
-        title = (details.title if details else "") or title
         self.show_home()
-        self.set_url(video.url, f"{video.title} ({video.channel})", artist, title)
+        a, t = va or artist, vt or title
+        self.set_url(video.url, f"{video.title} ({video.channel})", a, t)
+        if details is None and a and t:
+            threading.Thread(target=self.confirm_names, args=(video.url, a, t), daemon=True).start()
+
+    def confirm_names(self, source, a, t):
+        """Look the names up (source: the chosen file or video). If only the swapped order is a
+        known song ('Song - Artist' names), swap them; known songs also get their proper spelling.
+        Leaves the fields alone if the user has edited them meanwhile."""
+        d = lookup_names(a, t)
+
+        def apply():
+            try:  # the home screen may be gone (another screen is open)
+                if source not in (self.src, self.src_url) or \
+                        (self.artist.get().strip(), self.title_e.get().strip()) != (a, t):
+                    return
+                for entry, val in ((self.artist, d.artist), (self.title_e, d.title)):
+                    entry.delete(0, "end")
+                    entry.insert(0, val)
+            except Exception:
+                return
+            self.details = d
+        if d:
+            self.ui(apply)
 
     def pick_folder(self):
         from tkinter import filedialog
@@ -337,6 +384,155 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             self.folder_lbl.configure(text=d)
             self.cfg["songs_dir"] = d
             save_config(self.cfg)
+
+    # ---------- convert a folder ----------
+    def pick_batch_folder(self):
+        from tkinter import filedialog
+        d = filedialog.askdirectory(title="Folder of songs to convert",
+                                    initialdir=self.cfg.get("batch_dir") or None)
+        if d:
+            self.cfg["batch_dir"] = d
+            save_config(self.cfg)
+            self.show_batch(Path(d))
+
+    def show_batch(self, folder: Path):
+        # audio files, but not the stems inside finished song folders
+        files = sorted(p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in AUDIO_EXT
+                       and not tidy.is_song_folder(p.parent) and p.stem.lower() not in STEM_NAMES)
+        f = ctk.CTkFrame(self, fg_color="transparent")
+        self.back_button(f)
+        self.header(f, "Convert a folder",
+                    f"{len(files)} song{'s' if len(files) != 1 else ''} found in {folder}. Check the names "
+                    "(they are looked up again while converting), untick any to skip, then convert.")
+        lst = ctk.CTkScrollableFrame(f, fg_color=CARD, corner_radius=12)
+        lst.pack(fill="both", expand=True)
+        lst.columnconfigure((1, 2), weight=1, uniform="n")
+        self.batch_rows = []
+        for r, p in enumerate(files):
+            a, t = search.names_from_file(p.stem)
+            var = ctk.BooleanVar(value=True)
+            ctk.CTkCheckBox(lst, text="", variable=var, width=24).grid(row=2 * r, column=0, rowspan=2, padx=(8, 4))
+            ea, et = ctk.CTkEntry(lst, placeholder_text="Artist"), ctk.CTkEntry(lst, placeholder_text="Song title")
+            ea.insert(0, a)
+            et.insert(0, t)
+            ea.grid(row=2 * r, column=1, sticky="ew", pady=(8, 0))
+            et.grid(row=2 * r, column=2, sticky="ew", padx=(8, 8), pady=(8, 0))
+            ctk.CTkLabel(lst, text=p.name, text_color=MUTED, anchor="w", font=ctk.CTkFont(size=11)).grid(
+                row=2 * r + 1, column=1, columnspan=2, sticky="w")
+            self.batch_rows.append((p, var, ea, et))
+        out = ctk.CTkFrame(f, fg_color="transparent")
+        out.pack(fill="x", pady=(10, 0))
+        ctk.CTkLabel(out, text="Save to", text_color=MUTED).pack(side="left")
+        out_lbl = ctk.CTkLabel(out, text=str(self.songs_dir), anchor="w")
+        out_lbl.pack(side="left", padx=10, fill="x", expand=True)
+
+        def change():
+            from tkinter import filedialog
+            d = filedialog.askdirectory(title="Save new songs to",
+                                        initialdir=str(self.songs_dir) if self.songs_dir.exists() else None)
+            if d:
+                self.songs_dir = Path(d)
+                out_lbl.configure(text=d)
+                self.cfg["songs_dir"] = d
+                save_config(self.cfg)
+        ctk.CTkButton(out, text="Change", width=80, fg_color=CARD, hover_color=CARD_HOVER,
+                      text_color=("#222", "#eee"), command=change).pack(side="right")
+        ctk.CTkButton(f, text=f"Convert {len(files)} song{'s' if len(files) != 1 else ''}", height=46,
+                      corner_radius=12, font=ctk.CTkFont(size=16, weight="bold"), fg_color=ACCENT,
+                      hover_color=ACCENT_HOVER, state="normal" if files else "disabled",
+                      command=self.start_batch).pack(fill="x", pady=(12, 0))
+        self.switch(f)
+
+    def start_batch(self):
+        items = [(p, ea.get().strip(), et.get().strip() or p.stem)
+                 for p, var, ea, et in self.batch_rows if var.get()]
+        if not items:
+            return
+        self.cfg["songs_dir"] = str(self.songs_dir)
+        save_config(self.cfg)
+        self.working = True
+        self.stop.clear()
+        self.steps = pipeline.STEPS
+        f = ctk.CTkFrame(self, fg_color="transparent")
+        self.header(f, f"Converting {len(items)} song{'s' if len(items) != 1 else ''}",
+                    "Each song takes a minute or two. You can leave this running.")
+        self.batch_now = ctk.CTkLabel(f, text="", font=ctk.CTkFont(size=17, weight="bold"), anchor="w")
+        self.batch_now.pack(fill="x")
+        card = ctk.CTkFrame(f, fg_color=CARD, corner_radius=18)
+        card.pack(fill="x", pady=(8, 0))
+        self.step_lbls = []
+        for s in self.steps:
+            lbl = ctk.CTkLabel(card, text=f"○  {s}", anchor="w", font=ctk.CTkFont(size=15), text_color=MUTED)
+            lbl.pack(fill="x", padx=24, pady=(12 if not self.step_lbls else 4, 0))
+            self.step_lbls.append(lbl)
+        ctk.CTkLabel(card, text="").pack(pady=2)
+        self.bar = ctk.CTkProgressBar(f, height=14, progress_color=ACCENT)
+        self.bar.set(0)
+        self.bar.pack(fill="x", pady=(16, 6))
+        self.pct = ctk.CTkLabel(f, text="Starting...", text_color=MUTED)
+        self.pct.pack()
+        self.batch_log = ctk.CTkLabel(f, text="", anchor="w", justify="left", text_color=MUTED)
+        self.batch_log.pack(fill="x", pady=(6, 0))
+        ctk.CTkButton(f, text="Cancel", width=110, fg_color=CARD, hover_color=CARD_HOVER,
+                      text_color=("#222", "#eee"), command=self.cancel).pack(pady=12)
+        self.switch(f)
+        threading.Thread(target=self.batch_work, args=(items,), daemon=True).start()
+
+    def batch_work(self, items):
+        results, n = [], len(items)
+        for k, (src, a, t) in enumerate(items):
+            if self.stop.is_set():
+                break
+            tmp = Path(tempfile.mkdtemp(prefix="chc_batch_"))
+            try:
+                d = lookup_names(a, t)  # proper names (and the swapped order) when known
+                if d:
+                    a, t = d.artist, d.title
+                self.ui(lambda k=k, a=a, t=t: self.batch_now.configure(
+                    text=f"Song {k + 1} of {n}:  {a + ' - ' if a else ''}{t}"))
+                cover = search.cover_art(d, tmp / "cover.jpg") if d else None
+                res = pipeline.make_song(
+                    src, a, t, self.songs_dir, charter=self.cfg.get("charter", ""),
+                    on_step=lambda i: self.ui(self.set_step, i),
+                    on_progress=lambda fr, k=k: self.ui(self.set_progress, (k + fr) / n),
+                    stop=self.stop, details=d, cover=cover)
+                shutil.rmtree(res.preview_dir, ignore_errors=True)  # no previews in batch mode
+                results.append((a, t, res.song_dir, ""))
+            except pipeline.Cancelled:
+                break
+            except Exception as e:
+                traceback.print_exc()
+                results.append((a, t, None, str(e).splitlines()[0] if str(e) else e.__class__.__name__))
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+            done = sum(1 for r in results if r[2])
+            self.ui(lambda done=done, k=k: self.batch_log.configure(
+                text=f"{done} done, {k + 1 - done} failed so far"))
+        self.ui(self.show_batch_done, results, n)
+
+    def show_batch_done(self, results, n):
+        self.working = False
+        ok = [r for r in results if r[2]]
+        f = ctk.CTkFrame(self, fg_color="transparent")
+        title = f"{len(ok)} of {n} song{'s' if n != 1 else ''} converted"
+        self.header(f, title + (" ✓" if len(ok) == n else ""),
+                    f"Saved to {self.songs_dir}. Rescan songs in Clone Hero to see them."
+                    + ("" if len(results) == n else "  (Stopped early.)"))
+        lst = ctk.CTkScrollableFrame(f, fg_color=CARD, corner_radius=12)
+        lst.pack(fill="both", expand=True)
+        for a, t, song_dir, err in results:
+            name = f"{a + ' - ' if a else ''}{t}"
+            ctk.CTkLabel(lst, text=(f"✓  {name}" if song_dir else f"✗  {name}:  {err}"),
+                         anchor="w", justify="left", wraplength=680,
+                         text_color=("#111", "#fff") if song_dir else "#e0a23a").pack(fill="x", padx=12, pady=3)
+        btns = ctk.CTkFrame(f, fg_color="transparent")
+        btns.pack(fill="x", pady=(14, 0))
+        ctk.CTkButton(btns, text="Open songs folder", height=44, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                      command=lambda: os.startfile(self.songs_dir)).pack(side="left", expand=True, fill="x")
+        ctk.CTkButton(btns, text="Back to start", height=44, fg_color=CARD, hover_color=CARD_HOVER,
+                      text_color=("#222", "#eee"), command=self.another).pack(
+            side="left", expand=True, fill="x", padx=(12, 0))
+        self.switch(f)
 
     # ---------- settings ----------
     def back_button(self, parent, command=None):
@@ -351,10 +547,11 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
         card = ctk.CTkFrame(f, fg_color=CARD, corner_radius=14)
         card.pack(fill="x", pady=(0, 12))
-        ctk.CTkLabel(card, text="Songs folder", font=ctk.CTkFont(size=15, weight="bold")).pack(
+        ctk.CTkLabel(card, text="Save new songs to", font=ctk.CTkFont(size=15, weight="bold")).pack(
             anchor="w", padx=16, pady=(12, 0))
-        ctk.CTkLabel(card, text="Where new songs are saved, and which folder gets tidied.",
-                     text_color=MUTED).pack(anchor="w", padx=16)
+        ctk.CTkLabel(card, text="Where converted songs and downloaded charts are saved (also shown, "
+                                "and changeable, on the main screen).",
+                     text_color=MUTED, wraplength=680, justify="left").pack(anchor="w", padx=16)
         row = ctk.CTkFrame(card, fg_color="transparent")
         row.pack(fill="x", padx=16, pady=(6, 14))
         lbl = ctk.CTkLabel(row, text=str(self.songs_dir), anchor="w")
@@ -362,7 +559,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
 
         def change():
             from tkinter import filedialog
-            d = filedialog.askdirectory(title="Songs folder",
+            d = filedialog.askdirectory(title="Save new songs to",
                                         initialdir=str(self.songs_dir) if self.songs_dir.exists() else None)
             if d:
                 self.songs_dir = Path(d)
@@ -392,11 +589,12 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         card3.pack(fill="x")
         ctk.CTkLabel(card3, text="Tidy song names", font=ctk.CTkFont(size=15, weight="bold")).pack(
             anchor="w", padx=16, pady=(12, 0))
-        ctk.CTkLabel(card3, text="Scan your songs folder and clean up names like "
-                                 "\u201cArtist - Song (Live) (Harmonix)\u201d \u2192 \u201cArtist - Song\u201d. "
-                                 "You review every change first, and it can be undone.",
+        ctk.CTkLabel(card3, text="Pick any folder and give every song in it the same \u201cArtist - Song "
+                                 "Title\u201d name, cleaning up names like \u201cArtist - Song (Live) "
+                                 "(Harmonix)\u201d along the way. You review every change first, and it can "
+                                 "be undone.",
                      text_color=MUTED, wraplength=680, justify="left").pack(anchor="w", padx=16)
-        ctk.CTkButton(card3, text="Scan songs folder...", height=38, fg_color=ACCENT,
+        ctk.CTkButton(card3, text="Tidy a folder...", height=38, fg_color=ACCENT,
                       hover_color=ACCENT_HOVER, command=lambda: (save_charter(), self.show_tidy())
                       ).pack(anchor="w", padx=16, pady=(8, 14))
 
@@ -430,11 +628,21 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     def show_tidy(self, message=""):
         f = ctk.CTkFrame(self, fg_color="transparent")
         self.back_button(f, self.show_settings)
-        self.header(f, "Tidy song names", str(self.songs_dir))
+        self.header(f, "Tidy song names", "Every song gets the same “Artist - Song Title” name. "
+                                          "Nothing changes until you press Rename.")
+        where = ctk.CTkFrame(f, fg_color="transparent")
+        where.pack(fill="x", pady=(0, 8))
+        ctk.CTkLabel(where, text="Folder", text_color=MUTED).pack(side="left")
+        ctk.CTkLabel(where, text=str(self.tidy_dir), anchor="w").pack(side="left", padx=10, fill="x", expand=True)
+        ctk.CTkButton(where, text="Choose folder...", width=130, fg_color=CARD, hover_color=CARD_HOVER,
+                      text_color=("#222", "#eee"), command=self.pick_tidy_folder).pack(side="right")
         self.tidy_parens = ctk.BooleanVar(value=self.cfg.get("tidy_parens", True))
         self.tidy_brackets = ctk.BooleanVar(value=self.cfg.get("tidy_brackets", True))
+        self.tidy_ini = ctk.BooleanVar(value=self.cfg.get("tidy_ini", True))
         opts = ctk.CTkFrame(f, fg_color="transparent")
         opts.pack(fill="x")
+        ctk.CTkCheckBox(opts, text="Artist - Song Title (from song.ini)", variable=self.tidy_ini,
+                        command=self.rescan).pack(side="left", padx=(0, 18))
         ctk.CTkCheckBox(opts, text="Remove (parentheses)", variable=self.tidy_parens,
                         command=self.rescan).pack(side="left")
         ctk.CTkCheckBox(opts, text="Remove [brackets]", variable=self.tidy_brackets,
@@ -455,18 +663,30 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.switch(f)
         self.rescan()
 
+    def pick_tidy_folder(self):
+        from tkinter import filedialog
+        d = filedialog.askdirectory(title="Folder to tidy",
+                                    initialdir=str(self.tidy_dir) if self.tidy_dir.exists() else None)
+        if d:
+            self.tidy_dir = Path(d)
+            self.cfg["tidy_dir"] = d
+            save_config(self.cfg)
+            self.show_tidy()
+
     def rescan(self):
         self.cfg["tidy_parens"] = self.tidy_parens.get()
         self.cfg["tidy_brackets"] = self.tidy_brackets.get()
+        self.cfg["tidy_ini"] = self.tidy_ini.get()
         save_config(self.cfg)
         for w in self.tidy_list.winfo_children():
             w.destroy()
         self.proposals = []
-        if not self.songs_dir.exists():
-            ctk.CTkLabel(self.tidy_list, text="The songs folder does not exist yet.",
+        if not self.tidy_dir.exists():
+            ctk.CTkLabel(self.tidy_list, text="That folder does not exist. Choose another one.",
                          text_color=MUTED).pack(pady=20)
         else:
-            self.proposals = tidy.scan(self.songs_dir, self.tidy_parens.get(), self.tidy_brackets.get())
+            self.proposals = tidy.scan(self.tidy_dir, self.tidy_parens.get(), self.tidy_brackets.get(),
+                                       self.tidy_ini.get())
         self.tidy_vars = []
         for p in self.proposals:
             var = ctk.BooleanVar(value=p.selected)
@@ -482,22 +702,22 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             ctk.CTkLabel(txt, text="\u2192  " + p.new_name + (f"   (skipped: {p.note})" if p.note else ""),
                          anchor="w", wraplength=640, justify="left",
                          text_color=("#111", "#fff") if p.ok else "#e0a23a").pack(fill="x")
-        if self.songs_dir.exists() and not self.proposals:
+        if self.tidy_dir.exists() and not self.proposals:
             ctk.CTkLabel(self.tidy_list, text="Nothing to tidy. All song names are already clean.",
                          text_color=MUTED).pack(pady=24)
         self.tidy_apply.configure(state="normal" if any(p.ok for p in self.proposals) else "disabled")
-        self.tidy_undo.configure(state="normal" if tidy.can_undo(self.songs_dir) else "disabled")
+        self.tidy_undo.configure(state="normal" if tidy.can_undo(self.tidy_dir) else "disabled")
 
     def apply_tidy(self):
         for p, v in zip(self.proposals, self.tidy_vars):
             p.selected = v.get()
-        n, errs = tidy.apply(self.proposals, self.songs_dir, self.tidy_parens.get(),
+        n, errs = tidy.apply(self.proposals, self.tidy_dir, self.tidy_parens.get(),
                              self.tidy_brackets.get())
         msg = f"Renamed {n} folder{'s' if n != 1 else ''}." + (f" {len(errs)} failed: {errs[0]}" if errs else "")
         self.show_tidy(msg)
 
     def undo_tidy(self):
-        n, errs = tidy.undo(self.songs_dir)
+        n, errs = tidy.undo(self.tidy_dir)
         self.show_tidy(f"Restored {n} folder name{'s' if n != 1 else ''}." + (f" {errs[0]}" if errs else ""))
 
     # ---------- progress ----------

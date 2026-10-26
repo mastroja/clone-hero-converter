@@ -1,5 +1,7 @@
 """Clean up song folder names, e.g.
-"Jimi Hendrix - Voodoo Child (Slight Return) (Live) (Harmonix)" -> "Jimi Hendrix - Voodoo Child".
+"Jimi Hendrix - Voodoo Child (Slight Return) (Live) (Harmonix)" -> "Jimi Hendrix - Voodoo Child",
+and (with from_ini) give every song the same "Artist - Song Title" form, taken from the artist
+and name in its song.ini ("voodoo_child_final" -> "Jimi Hendrix - Voodoo Child").
 
 Scanning never touches disk; apply() renames folders (and fixes the name in song.ini)
 and writes an undo log next to the songs folder root.
@@ -13,6 +15,36 @@ SONG_MARKERS = ("song.ini", "notes.chart", "notes.mid")
 PARENS = re.compile(r"\s*\([^()]*\)")
 BRACKETS = re.compile(r"\s*\[[^\[\]]*\]")
 UNDO_LOG = ".chc_rename_log.json"
+BAD_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')  # not allowed in Windows folder names
+
+
+def read_ini(folder: Path) -> dict:
+    out = {}
+    try:
+        text = (folder / "song.ini").read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        m = re.match(r"\s*([A-Za-z0-9_]+)\s*=\s*(.*?)\s*$", line)
+        if m:
+            out[m.group(1).lower()] = m.group(2)
+    return out
+
+
+def _key(name: str) -> str:
+    """Name for comparing: no capitals, '&' as 'and', letters and digits only."""
+    return re.sub(r"[^a-z0-9]", "", name.lower().replace("&", "and"))
+
+
+def ini_name(folder: Path) -> str | None:
+    """'Artist - Song Title' from the folder's song.ini, or None without both."""
+    ini = read_ini(folder)
+    artist, name = ini.get("artist", "").strip(), ini.get("name", "").strip()
+    if not artist or not name:
+        return None
+    if name.lower().startswith(artist.lower() + " - "):
+        return name  # the title already starts with the artist
+    return f"{artist} - {name}"
 
 
 def clean_name(name: str, parens: bool = True, brackets: bool = True) -> str:
@@ -47,8 +79,10 @@ def is_song_folder(p: Path) -> bool:
     return p.is_dir() and any((p / m).exists() for m in SONG_MARKERS)
 
 
-def scan(root: Path, parens: bool = True, brackets: bool = True) -> list[Proposal]:
-    """Find song folders under root whose names would change."""
+def scan(root: Path, parens: bool = True, brackets: bool = True, from_ini: bool = True) -> list[Proposal]:
+    """Find song folders under root whose names would change. from_ini names each song
+    "Artist - Song Title" from its song.ini (when it has both); otherwise the folder name is
+    only cleaned."""
     found: list[Proposal] = []
     taken: set[Path] = set()
 
@@ -59,7 +93,13 @@ def scan(root: Path, parens: bool = True, brackets: bool = True) -> list[Proposa
             return
         for c in kids:
             if is_song_folder(c):
-                new = clean_name(c.name, parens, brackets)
+                cleaned = clean_name(c.name, parens, brackets)
+                base = (ini_name(c) if from_ini else None) or cleaned
+                new = clean_name(base, parens, brackets)
+                if _key(new) == _key(cleaned):
+                    new = cleaned  # same words: keep the folder's own spelling and capitals
+                # Windows forbids some characters, and trailing dots or spaces
+                new = BAD_CHARS.sub("", new).rstrip(" .").strip() or c.name
                 if new != c.name:
                     target = c.with_name(new)
                     note = ""
