@@ -148,6 +148,10 @@ def run_convert(j: Job, stop: threading.Event):
                                  on_step=on_step, on_progress=on_progress, stop=stop,
                                  details=details, cover=cover)
         shutil.rmtree(res.preview_dir, ignore_errors=True)
+        try:  # same names and capitals as the rest of the library
+            res.song_dir = tidy.tidy_one(res.song_dir, artist_map=artist_map())
+        except (FileExistsError, OSError):
+            pass
         if j.by:  # shows on Clone Hero's loading screen, and in RockWizard
             tidy.write_ini(res.song_dir, {"chc_added_by": j.by, "loading_phrase": f"Suggested by {j.by}"})
         rep = review.check(res.song_dir, live_dir())
@@ -675,10 +679,10 @@ async def song_details_set(req: Request):
     tidy.write_ini(f, fields)
     if b.get("rename"):
         try:
-            new = tidy.tidy_one(f)
+            new = tidy.tidy_one(f, artist_map=artist_map())
         except FileExistsError as e:
             raise HTTPException(409, f"Saved, but couldn't rename: “{e}” already exists")
-        if new != f:
+        if str(new) != str(f):
             _reviews.pop(str(f), None)
             f = new
     return song_summary(f)
@@ -711,14 +715,20 @@ def library_batch(request: Request, folder: str):
     return {"folder": str(root), "files": out}
 
 
+def artist_map() -> dict:
+    """How the live library capitalizes each artist (staging songs aren't trusted for this)."""
+    return tidy.artist_spellings(live_dir()) if live_dir() else {}
+
+
 @app.get("/api/tidy")
-def tidy_scan(request: Request, folder: str, parens: bool = True, brackets: bool = True, ini: bool = True):
+def tidy_scan(request: Request, folder: str, parens: bool = True, brackets: bool = True, ini: bool = True,
+              caps: bool = True):
     require_owner(request)
     root = body_folder(folder)
-    props = tidy.scan(root, parens, brackets, ini)
+    props = tidy.scan(root, parens, brackets, ini, caps, artist_map() if caps else None)
     return {"folder": str(root), "can_undo": tidy.can_undo(root),
-            "proposals": [{"path": str(p.path), "name": p.path.name, "new_name": p.new_name, "note": p.note}
-                          for p in props]}
+            "proposals": [{"path": str(p.path), "name": p.path.name, "new_name": p.new_name, "note": p.note,
+                           "ini_only": p.ini_only} for p in props]}
 
 
 @app.post("/api/tidy/apply")
@@ -727,10 +737,12 @@ async def tidy_apply(req: Request):
     b = await req.json()
     root = body_folder(b["folder"])
     chosen = set(b.get("paths", []))
-    props = [p for p in tidy.scan(root, b.get("parens", True), b.get("brackets", True), b.get("ini", True))]
+    caps = b.get("caps", True)
+    amap = artist_map() if caps else None
+    props = tidy.scan(root, b.get("parens", True), b.get("brackets", True), b.get("ini", True), caps, amap)
     for p in props:
         p.selected = str(p.path) in chosen
-    n, errs = tidy.apply(props, root, b.get("parens", True), b.get("brackets", True))
+    n, errs = tidy.apply(props, root, b.get("parens", True), b.get("brackets", True), True, caps, amap)
     return {"renamed": n, "errors": errs}
 
 

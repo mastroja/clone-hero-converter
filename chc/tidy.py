@@ -3,9 +3,15 @@
 and (with from_ini) give every song the same "Artist - Song Title" form, taken from the artist
 and name in its song.ini ("voodoo_child_final" -> "Jimi Hendrix - Voodoo Child").
 
-Scanning never touches disk; apply() renames folders (and fixes the name in song.ini)
+With caps, names get the library's capitals too: lowercase words get a capital first letter
+("whats up" -> "Whats Up"), small words stay lowercase mid-title ("Ring of Fire"), words that
+already have capitals are left alone (AC/DC, alt-J), and an artist already in the library keeps
+its spelling there (dredg, blink-182).
+
+Scanning never touches disk; apply() renames folders (and fixes the name/artist in song.ini)
 and writes an undo log next to the songs folder root.
 """
+from collections import Counter
 import json
 import re
 from dataclasses import dataclass
@@ -58,7 +64,8 @@ def clean_name(name: str, parens: bool = True, brackets: bool = True) -> str:
             out = BRACKETS.sub("", out)
         if out == before:
             break
-    out = re.sub(r"\s{2,}", " ", out).strip(" -_.")
+    # (a final "." stays: "B.Y.O.B.", "L.A."; folder names lose it later, as Windows needs)
+    out = re.sub(r"\s{2,}", " ", out).strip(" -_")
     out = re.sub(r"\s+-\s*$", "", out).strip()
     return out if out else name  # never produce an empty name
 
@@ -69,6 +76,7 @@ class Proposal:
     new_name: str
     note: str = ""      # why it cannot be applied, if so
     selected: bool = True
+    ini_only: bool = False  # the folder name is fine; only song.ini's capitals change
 
     @property
     def ok(self) -> bool:
@@ -79,31 +87,117 @@ def is_song_folder(p: Path) -> bool:
     return p.is_dir() and any((p / m).exists() for m in SONG_MARKERS)
 
 
-def proposed_name(c: Path, parens: bool = True, brackets: bool = True, from_ini: bool = True) -> str:
+# ---------- capitals ----------
+SMALL = {"a", "an", "the", "and", "but", "or", "nor", "for", "of", "on", "in", "at", "to", "by", "vs", "vs.",
+         "with", "from", "as", "per", "via", "feat", "feat.", "ft", "ft.", "n", "o", "de", "la", "le", "x"}
+
+
+def fix_case(text: str, artist_map: dict | None = None) -> str:
+    """Title capitals for a song or artist name. Only all-lowercase words change (or every word
+    when the whole name is SHOUTED), so stylized names with capitals stay as they are."""
+    if artist_map and _lkey(text) in artist_map:
+        return artist_map[_lkey(text)]  # same letters, the library's capitals
+    if not text or "<" in text:  # Clone Hero <color> tags: leave alone
+        return text
+    if re.search(r"[À-ÿ]", text):  # accented letters: probably not English, whose title rules differ
+        return text
+    letters = re.sub(r"[^A-Za-z]", "", text)
+    shouted = len(text.split()) > 1 and letters.isupper() and len(letters) > 3
+    words = text.split(" ")
+    out = []
+    for i, w in enumerate(words):
+        core = w.strip("\"'(“”‘[")
+        if not core or not core[0].isalpha():  # "21st", "3's", "&": leave as they are
+            out.append(w)
+            continue
+        if shouted:
+            w = w.lower()
+        elif w != w.lower():
+            out.append(w)  # already has capitals: someone chose them
+            continue
+        prev = out[-1] if out else ""
+        starts = i == 0 or prev.endswith((":", "-", "–", "(", "/")) or prev in ("-", "–") or w.startswith("(")
+        last = i == len(words) - 1
+        if core.lower() in SMALL and not starts and not last:
+            out.append(w)
+        else:
+            k = next(j for j, ch in enumerate(w) if ch.isalpha())
+            out.append(w[:k] + w[k].upper() + w[k + 1:])
+    return " ".join(out)
+
+
+def _lkey(name: str) -> str:
+    """Name for matching spellings that differ only in capitals."""
+    return " ".join(name.lower().split())
+
+
+def artist_spellings(*roots: Path) -> dict:
+    """How the library capitalizes each artist: {lowercased artist: most common spelling}.
+    Only capitals are learned, never other spellings ('&' vs 'and', 'Blink 182' vs 'Blink-182')."""
+    seen: dict[str, Counter] = {}
+
+    def walk(d: Path):
+        try:
+            kids = [c for c in d.iterdir() if c.is_dir()]
+        except OSError:
+            return
+        for c in kids:
+            if is_song_folder(c):
+                a = read_ini(c).get("artist", "").strip()
+                if a and "<" not in a:
+                    seen.setdefault(_lkey(a), Counter())[" ".join(a.split())] += 1
+            else:
+                walk(c)
+    for r in roots:
+        if r and Path(r).exists():
+            walk(Path(r))
+    def rank(kv):
+        name, count = kv
+        words = name.split()
+        # deliberate styling first (KISS, DragonForce, TV), then standard title capitals with
+        # small words lowercase ("Band of Horses"), then the most common spelling
+        inner = sum(ch.isupper() for w in words for ch in w[1:])
+        small_low = sum(1 for i, w in enumerate(words) if 0 < i < len(words) - 1 and w in SMALL)
+        return inner, small_low, count
+    return {k: max(c.items(), key=rank)[0] for k, c in seen.items() if k}
+
+
+def _split_name(name: str) -> tuple[str, str]:
+    a, sep, t = name.partition(" - ")
+    return (a, t) if sep else ("", name)
+
+
+def proposed_name(c: Path, parens: bool = True, brackets: bool = True, from_ini: bool = True,
+                  caps: bool = False, artist_map: dict | None = None) -> str:
     """The tidy folder name for one song folder (the same rules as scan)."""
     cleaned = clean_name(c.name, parens, brackets)
     base = (ini_name(c) if from_ini else None) or cleaned
     new = clean_name(base, parens, brackets)
     if _key(new) == _key(cleaned):
         new = cleaned  # same words: keep the folder's own spelling and capitals
+    if caps:
+        a, t = _split_name(new)
+        new = f"{fix_case(a, artist_map)} - {fix_case(t)}" if a else fix_case(t)
     # Windows forbids some characters, and trailing dots or spaces
     return BAD_CHARS.sub("", new).rstrip(" .").strip() or c.name
 
 
-def tidy_one(folder: Path, parens: bool = True, brackets: bool = True) -> Path:
-    """Tidy a single song right away (after its details are edited): clean the title in
-    song.ini and rename the folder 'Artist - Song Title'. Raises FileExistsError if that
-    name is taken. Returns the folder's new path."""
-    _fix_ini(folder, parens, brackets)
-    target = folder.with_name(proposed_name(folder, parens, brackets))
-    if target != folder:
+def tidy_one(folder: Path, parens: bool = True, brackets: bool = True, caps: bool = True,
+             artist_map: dict | None = None) -> Path:
+    """Tidy a single song right away (after its details are edited, or a new conversion):
+    clean the title in song.ini, fix capitals, and rename the folder 'Artist - Song Title'.
+    Raises FileExistsError if that name is taken. Returns the folder's new path."""
+    _fix_ini(folder, parens, brackets, caps, artist_map)
+    target = folder.with_name(proposed_name(folder, parens, brackets, True, caps, artist_map))
+    if str(target) != str(folder):  # Windows paths compare without capitals
         if target.exists() and target.resolve() != folder.resolve():
             raise FileExistsError(target.name)
         folder.rename(target)  # a case-only rename works on Windows too
     return target
 
 
-def scan(root: Path, parens: bool = True, brackets: bool = True, from_ini: bool = True) -> list[Proposal]:
+def scan(root: Path, parens: bool = True, brackets: bool = True, from_ini: bool = True,
+         caps: bool = False, artist_map: dict | None = None) -> list[Proposal]:
     """Find song folders under root whose names would change. from_ini names each song
     "Artist - Song Title" from its song.ini (when it has both); otherwise the folder name is
     only cleaned."""
@@ -117,8 +211,10 @@ def scan(root: Path, parens: bool = True, brackets: bool = True, from_ini: bool 
             return
         for c in kids:
             if is_song_folder(c):
-                new = proposed_name(c, parens, brackets, from_ini)
-                if new != c.name:
+                new = proposed_name(c, parens, brackets, from_ini, caps, artist_map)
+                if new == c.name and from_ini and _ini_fixes(c, parens, brackets, caps, artist_map):
+                    found.append(Proposal(c, new, ini_only=True))
+                elif new != c.name:
                     target = c.with_name(new)
                     note = ""
                     if target.exists() and target != c:
@@ -153,38 +249,61 @@ def write_ini(folder: Path, fields: dict) -> None:
     ini.write_text(text, encoding="utf-8")
 
 
-def _fix_ini(folder: Path, parens: bool, brackets: bool) -> None:
+def _ini_fixes(folder: Path, parens: bool, brackets: bool, caps: bool = False,
+               artist_map: dict | None = None) -> tuple[str, str] | None:
+    """(old text, new text) of song.ini with the tidy fixes, or None when nothing changes."""
     ini = folder / "song.ini"
-    if not ini.exists():
-        return
     try:
         text = ini.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeDecodeError):
-        return
+        return None
     lines = text.splitlines(keepends=True)
     for i, line in enumerate(lines):
-        m = re.match(r"(\s*name\s*=\s*)(.*?)(\r?\n?)$", line, re.I)
-        if m:
-            lines[i] = m.group(1) + clean_name(m.group(2), parens, brackets) + m.group(3)
+        m = re.match(r"(\s*(name|artist)\s*=\s*)(.*?)(\r?\n?)$", line, re.I)
+        if not m:
+            continue
+        value = m.group(3)
+        if m.group(2).lower() == "name":
+            value = clean_name(value, parens, brackets)
+            value = fix_case(value) if caps else value
+        elif caps:
+            value = fix_case(value, artist_map)
+        if value.strip() != m.group(3).strip():  # only real changes, not stray spaces
+            lines[i] = m.group(1) + value + m.group(4)
+    new = "".join(lines)
+    return (text, new) if new != text else None
+
+
+def _fix_ini(folder: Path, parens: bool, brackets: bool, caps: bool = False,
+             artist_map: dict | None = None) -> str | None:
+    """Apply the song.ini fixes; returns the old text (for undo) when something changed."""
+    fixes = _ini_fixes(folder, parens, brackets, caps, artist_map)
+    if not fixes:
+        return None
     try:
-        ini.write_text("".join(lines), encoding="utf-8")
+        (folder / "song.ini").write_text(fixes[1], encoding="utf-8")
     except OSError:
-        pass
+        return None
+    return fixes[0]
 
 
 def apply(proposals: list[Proposal], root: Path, parens: bool = True, brackets: bool = True,
-          fix_ini: bool = True) -> tuple[int, list[str]]:
-    """Rename the selected proposals. Returns (renamed_count, error messages)."""
+          fix_ini: bool = True, caps: bool = False, artist_map: dict | None = None) -> tuple[int, list[str]]:
+    """Rename the selected proposals. Returns (changed_count, error messages)."""
     done, errors, log = 0, [], []
     for p in proposals:
         if not (p.selected and p.ok):
             continue
         target = p.path.with_name(p.new_name)
         try:
-            p.path.rename(target)
-            log.append({"from": str(p.path), "to": str(target)})
+            if str(target) != str(p.path):  # capitals-only renames too
+                p.path.rename(target)
+            entry = {"from": str(p.path), "to": str(target)}
             if fix_ini:
-                _fix_ini(target, parens, brackets)
+                old = _fix_ini(target, parens, brackets, caps, artist_map)
+                if old is not None:
+                    entry["ini"] = old
+            log.append(entry)
             done += 1
         except OSError as e:
             errors.append(f"{p.path.name}: {e}")
@@ -201,7 +320,7 @@ def can_undo(root: Path) -> bool:
 
 
 def undo(root: Path) -> tuple[int, list[str]]:
-    """Reverse the last apply(). song.ini names are not restored."""
+    """Reverse the last apply(): folder names, and song.ini as it was before."""
     log_path = root / UNDO_LOG
     done, errors = 0, []
     try:
@@ -210,7 +329,10 @@ def undo(root: Path) -> tuple[int, list[str]]:
         return 0, ["no undo information found"]
     for e in reversed(entries):
         try:
-            Path(e["to"]).rename(e["from"])
+            if e["to"] != e["from"]:
+                Path(e["to"]).rename(e["from"])
+            if "ini" in e:
+                (Path(e["from"]) / "song.ini").write_text(e["ini"], encoding="utf-8")
             done += 1
         except OSError as ex:
             errors.append(f"{Path(e['to']).name}: {ex}")

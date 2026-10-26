@@ -408,7 +408,7 @@ async function openReview(folder, live = false) {
         ${f("d_name", "Title", s.title)}${f("d_artist", "Artist", s.artist)}${f("d_album", "Album", s.album)}
         ${f("d_year", "Year", s.year)}${f("d_genre", "Genre", s.genre)}${f("d_charter", "Charter", s.charter)}</div>
       <label class="item check" style="border:0;padding:10px 0 0"><input type="checkbox" id="d_rename" checked>
-        <div class="grow">Tidy it like Tidy names<div class="faint">Removes (…) and […] tags from the title and renames the folder “Artist - Song Title”</div></div></label>
+        <div class="grow">Tidy it like Tidy names<div class="faint">Fixes capitals, removes (…) and […] tags from the title, and renames the folder “Artist - Song Title”</div></div></label>
       <div class="row" style="margin-top:12px"><button class="btn primary" id="d_save">Save</button><button class="btn" id="d_cancel">Cancel</button></div>`;
     $("#editdet", dr).remove();
     $("#d_cancel", dr).onclick = () => openReview(s.folder, live);
@@ -541,15 +541,16 @@ function libUpdate() {
 }
 
 function libTidy() {
-  const o = S.tidyOpts || (S.tidyOpts = { ini: true, parens: true, brackets: true });
-  $("#lib").innerHTML = `<div class="card"><p class="muted" style="margin-top:0">Give every song the same “Artist - Song Title” name. Nothing changes until you press Rename, and it can be undone.</p>
+  const o = S.tidyOpts || (S.tidyOpts = { ini: true, parens: true, brackets: true, caps: true });
+  $("#lib").innerHTML = `<div class="card"><p class="muted" style="margin-top:0">Give every song the same “Artist - Song Title” name. Nothing changes until you press Tidy selected, and it can be undone (song.ini too).</p>
     ${folderField("tf", S.settings.tidy_dir || S.settings.live_dir || S.settings.songs_dir || "")}
     <div class="row wrap" style="margin-top:12px;gap:18px">
       <label class="check"><input type="checkbox" id="oini" ${o.ini ? "checked" : ""}> Artist - Song Title (from song.ini)</label>
       <label class="check"><input type="checkbox" id="opar" ${o.parens ? "checked" : ""}> Remove (parentheses)</label>
-      <label class="check"><input type="checkbox" id="obra" ${o.brackets ? "checked" : ""}> Remove [brackets]</label></div>
+      <label class="check"><input type="checkbox" id="obra" ${o.brackets ? "checked" : ""}> Remove [brackets]</label>
+      <label class="check"><input type="checkbox" id="ocap" ${o.caps ? "checked" : ""}> Fix capitals</label></div>
     <div id="tlist" style="margin-top:12px"></div></div>`;
-  const opts = () => ({ ini: $("#oini").checked, parens: $("#opar").checked, brackets: $("#obra").checked });
+  const opts = () => ({ ini: $("#oini").checked, parens: $("#opar").checked, brackets: $("#obra").checked, caps: $("#ocap").checked });
   const load = async () => {
     Object.assign(o, opts());
     const box = $("#tlist"); box.innerHTML = `<span class="spinner"></span>`;
@@ -557,18 +558,18 @@ function libTidy() {
       const r = await api("/api/tidy?" + qs({ folder: $("#tf").value, ...o }));
       box.innerHTML = (r.proposals.length ? `<div class="list">${r.proposals.map((p) => `
         <label class="item check"><input type="checkbox" class="tp" value="${esc(p.path)}" ${p.note ? "disabled" : "checked"}>
-          <div class="grow"><div class="faint ellipsis">${esc(p.name)}</div><div class="ellipsis">→ ${esc(p.new_name)}${p.note ? ` <span style="color:var(--warn)">(skipped: ${esc(p.note)})</span>` : ""}</div></div></label>`).join("")}</div>`
+          <div class="grow"><div class="faint ellipsis">${esc(p.name)}</div><div class="ellipsis">→ ${p.ini_only ? `<span class="muted">same folder name; fixes the title/artist in song.ini</span>` : esc(p.new_name)}${p.note ? ` <span style="color:var(--warn)">(skipped: ${esc(p.note)})</span>` : ""}</div></div></label>`).join("")}</div>`
         : `<div class="empty">All names are already tidy.</div>`) + `
-        <div class="row" style="margin-top:12px"><button class="btn primary" id="tapply" ${r.proposals.length ? "" : "disabled"}>Rename selected</button>
+        <div class="row" style="margin-top:12px"><button class="btn primary" id="tapply" ${r.proposals.length ? "" : "disabled"}>Tidy selected</button>
         <button class="btn" id="tundo" ${r.can_undo ? "" : "disabled"}>Undo last rename</button></div>`;
       $("#tapply").onclick = async () => {
         const res = await post("/api/tidy/apply", { folder: r.folder, paths: $$(".tp:checked").map((c) => c.value), ...o });
-        toast(`Renamed ${res.renamed}` + (res.errors.length ? ` · ${res.errors[0]}` : "")); load();
+        toast(`Tidied ${res.renamed}` + (res.errors.length ? ` · ${res.errors[0]}` : "")); load();
       };
       $("#tundo").onclick = async () => { const res = await post("/api/tidy/undo", { folder: r.folder }); toast(`Restored ${res.restored}`); load(); };
     } catch (e) { box.innerHTML = `<p class="chip red">${esc(e.message)}</p>`; }
   };
-  $$("#oini, #opar, #obra").forEach((c) => c.onchange = load);
+  $$("#oini, #opar, #obra, #ocap").forEach((c) => c.onchange = load);
   wireFolder(load); load();
 }
 
@@ -635,7 +636,6 @@ async function renderSettings() {
     : `Folder “${esc(sy.label)}”: ${esc(sy.state)}. ${(sy.devices || []).map((d) => `${esc(d.name)} ${d.connected ? `${Math.floor(d.completion)}% synced` : "offline"}`).join(" · ")}
        <div style="margin-top:10px"><button class="btn small" id="rescan">Sync now</button></div>`;
   const rs = $("#rescan"); if (rs) rs.onclick = async () => { try { await post("/api/sync/rescan"); toast("Syncthing is checking for changes"); } catch (e) { toast(e.message); } };
-  if (!local) { $("#phone").innerHTML = `<h2>Use RockWizard on your phone</h2><p class="muted">This phone is paired. Tip: in Safari, Share → Add to Home Screen.</p>`; return; }
   const devs = await api("/api/devices");
   const ago = (t) => { const m = Math.round((Date.now() / 1000 - t) / 60); return m < 2 ? "now" : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m / 60)} h ago` : `${Math.round(m / 1440)} d ago`; };
   $("#phone").insertAdjacentHTML("afterend", `<div class="card"><h2>Devices</h2>
@@ -650,7 +650,6 @@ async function renderSettings() {
     if (!confirm("Forget this device? It stays connected, but asks for a name again next time.")) return;
     await api(`/api/devices/${b.dataset.forget}`, { method: "DELETE" }); renderSettings();
   });
-  const su = await api("/api/startup");
   if (desk()) {
     $("#phone").insertAdjacentHTML("beforebegin", `<div class="card"><h2>Server</h2>
       <div class="row wrap" style="gap:12px"><div class="grow"><span class="chip green">Running</span>
@@ -664,6 +663,8 @@ async function renderSettings() {
       desk().server_stopped();
     };
   }
+  if (local) {
+  const su = await api("/api/startup");
   $("#phone").insertAdjacentHTML("beforebegin", `<div class="card"><h2>Start with Windows</h2>
     <label class="item check" style="border:0;padding:0"><input type="checkbox" id="startup" ${su.enabled ? "checked" : ""}>
       <div class="grow">Run RockWizard in the background when you sign in<div class="faint">So your phone can always reach it while the PC is on. No window opens; the desktop app uses the same server.</div></div></label></div>`);
@@ -671,16 +672,19 @@ async function renderSettings() {
     try { const r = await post("/api/startup", { enabled: e.target.checked }); e.target.checked = r.enabled; toast(r.enabled ? "RockWizard will start when you sign in" : "RockWizard won't start with Windows"); }
     catch (err) { e.target.checked = !e.target.checked; toast(err.message); }
   };
+  }
   const p = await api("/api/pairing");
-  $("#phone").innerHTML = `<h2>Use RockWizard on your phone</h2>
+  $("#phone").innerHTML = `<h2>${local ? "Use RockWizard on your phone" : "Share RockWizard"}</h2>
     <div class="row wrap" style="align-items:flex-start;gap:20px">
       ${p.qr ? `<div class="qr">${p.qr}</div>` : ""}
       <div class="grow" style="min-width:240px">
-        <p style="margin-top:0">Scan with your iPhone's camera, then in Safari tap <b>Share → Add to Home Screen</b>. Your PC still does the work.</p>
-        <p class="faint">At home this works over Wi-Fi. Away from home, install <b>Tailscale</b> (free) on this PC and your iPhone and sign in to both; the link then uses the Tailscale address (100.x.x.x).</p>
+        ${local ? `<p style="margin-top:0">Scan with your iPhone's camera, then in Safari tap <b>Share → Add to Home Screen</b>. Your PC still does the work.</p>
+        <p class="faint">At home this works over Wi-Fi. Away from home, install <b>Tailscale</b> (free) on this PC and your iPhone and sign in to both; the link then uses the Tailscale address (100.x.x.x).</p>`
+        : `<p style="margin-top:0">Let a friend scan this with their phone's camera. They'll be asked their name, and songs they add are marked with it.</p>
+        <p class="faint">They need to be on your Wi-Fi, or on your Tailscale network when away from home.</p>`}
         ${p.urls.map((u) => `<div style="margin-top:6px"><code>${esc(u)}</code></div>`).join("")}
-        <button class="btn small" id="newkey" style="margin-top:12px">New pairing key (unpairs other phones)</button></div></div>`;
-  $("#newkey").onclick = async () => { if (confirm("Make a new key? Phones paired before will need to scan again.")) { await post("/api/pairing/reset"); renderSettings(); } };
+        ${local ? `<button class="btn small" id="newkey" style="margin-top:12px">New pairing key (unpairs other phones)</button>` : ""}</div></div>`;
+  if (local) $("#newkey").onclick = async () => { if (confirm("Make a new key? Phones paired before will need to scan again.")) { await post("/api/pairing/reset"); renderSettings(); } };
 }
 
 // ---------- who's using the app ----------
