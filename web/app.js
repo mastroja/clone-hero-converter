@@ -184,8 +184,9 @@ async function doSearch() {
   if (!q) return;
   const out = $("#results");
   if (/^https?:\/\//.test(q)) {
-    await post("/api/jobs/convert", { url: q });
-    toast("Added to the queue"); location.hash = "queue"; return;
+    try { await post("/api/jobs/convert", { url: q }); toast("Added to the queue"); location.hash = "queue"; }
+    catch (e) { toast(`Couldn't start it: ${e.message}`); }
+    return;
   }
   out.innerHTML = `<div class="empty"><span class="spinner"></span><div>Searching charts, song details and YouTube…</div></div>`;
   try {
@@ -215,8 +216,11 @@ async function doSearch() {
     });
     $$("[data-video]", out).forEach((b) => b.onclick = async () => {
       const v = r.videos[b.dataset.video];
-      await post("/api/jobs/convert", { url: v.url, artist: v.artist, title: v.song });
-      toast(`Charting ${v.artist} – ${v.song}`); location.hash = "queue";
+      b.disabled = true; b.innerHTML = `<span class="spinner"></span>`;
+      try {
+        await post("/api/jobs/convert", { url: v.url, artist: v.artist, title: v.song });
+        toast(`Charting ${v.artist} – ${v.song}`); location.hash = "queue";
+      } catch (e) { toast(`Couldn't start it: ${e.message}`); b.disabled = false; b.textContent = "Chart this"; }
     });
   } catch (e) { out.innerHTML = `<p class="chip red">${esc(e.message)}</p>`; }
 }

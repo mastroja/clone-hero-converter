@@ -108,8 +108,10 @@ stops: dict[str, threading.Event] = {}
 CONVERT_STEPS = ["Downloading the song"] + pipeline.STEPS
 
 
-def add_job(kind, title, steps, by="", **args) -> Job:
-    j = Job(uuid.uuid4().hex[:10], kind, title, steps, args=args, by=by)
+def add_job(kind, label, steps, by="", **args) -> Job:
+    """label is what the queue shows; args (artist, title, path, url...) go to the job runner.
+    (Not called 'title': the song's title arrives in args under that name.)"""
+    j = Job(uuid.uuid4().hex[:10], kind, label, steps, args=args, by=by)
     jobs[j.id] = j
     stops[j.id] = threading.Event()
     job_queue.put(j.id)
