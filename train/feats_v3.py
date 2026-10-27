@@ -10,9 +10,9 @@ import torch
 from chc import features
 from chc import nn as cnn
 from . import data
-from .make_features import load_stem
+from .make_features import load_stem, load_stereo_stack
 
-KINDS = ["guitar", "guitar_hr", "bass", "bass_hr", "drums", "drums_hq"]
+KINDS = ["guitar", "guitar_hr", "bass", "bass_hr", "drums", "drums_hq", "guitar_st"]
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # Demucs stem file -> (source tag, instrument, sample rate); a kind uses the stems at its rate
 DM = {"ft_other": ("ft", "guitar", features.SR), "ft_bass": ("ft", "bass", features.SR),
@@ -27,12 +27,30 @@ def jobs_for(song, kinds):
         inst = cnn.instrument(kind)
         if inst not in song["notes"]:
             continue
+        if kind in features.STACKS:
+            # stereo guitar: needs separate_hq's stems; the keys channel is the Demucs piano
+            # stem for both the song's own guitar ('clean') and the Demucs 'other' stem ('ft')
+            stems = data.V3 / "stems" / sid
+            keys = stems / "s6_piano_st.flac"
+            if not keys.exists():
+                continue
+            if inst in song["stems"]:
+                yield ("stack", tuple(song["stems"][inst]), str(keys)), out / f"{sid}_clean_{kind}.npy", kind
+            if (stems / "ft_other_st.flac").exists():
+                yield ("stack", (str(stems / "ft_other_st.flac"),), str(keys)), out / f"{sid}_ft_{kind}.npy", kind
+            continue
         if inst in song["stems"]:
             yield song["stems"][inst], out / f"{sid}_clean_{kind}.npy", kind
         for stem, (src, i2, sr) in DM.items():
             p = data.V3 / "stems" / sid / f"{stem}.flac"
             if i2 == inst and sr == features.rate(kind) and p.exists():
                 yield [str(p)], out / f"{sid}_{src}_{kind}.npy", kind
+
+
+def load_any(paths, sr):
+    if paths and paths[0] == "stack":
+        return load_stereo_stack(list(paths[1]), paths[2], sr)
+    return load_stem(list(paths), sr)
 
 
 def main():
@@ -54,8 +72,8 @@ def main():
     with ThreadPoolExecutor(max_workers=12) as ex:
         for k in range(0, len(items), 24):  # bounded batches keep memory flat
             batch = items[k:k + 24]
-            for ((paths, sr), outs), wave in zip(batch, ex.map(lambda it: load_stem(list(it[0][0]), it[0][1]), batch)):
-                if len(wave) < features.SR:
+            for ((paths, sr), outs), wave in zip(batch, ex.map(lambda it: load_any(it[0][0], it[0][1]), batch)):
+                if wave.shape[-1] < features.SR:
                     continue
                 for dest, kind in outs:
                     data.save_npy(dest, features.compute(wave, kind, DEVICE))

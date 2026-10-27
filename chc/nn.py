@@ -20,6 +20,7 @@ for _k in ("guitar2", "guitar_hr"):
 for _k in ("bass2", "bass_hr"):
     CHANNELS[_k] = CHANNELS["bass"]
 CHANNELS["drums_hq"] = CHANNELS["drums"]
+CHANNELS["guitar_st"] = CHANNELS["guitar"]
 # optional extra outputs (train --rel): is this note's lowest fret above, equal to or below
 # the previous note's? Charters place frets by the melody's shape, not absolute pitch.
 REL = ["up", "same", "down"]
@@ -47,7 +48,8 @@ class NoteNet(nn.Module):
         self.n_out = n_out or len(CHANNELS[kind])
         self.context = context
         n_bins = features.n_bins(kind)
-        ch = [1, 16, 32, 48]
+        self.in_ch = features.channels(kind)  # stacked signals (stereo guitar: mid, side, keys)
+        ch = [self.in_ch, 16, 32, 48]
         pools = [3, 3, 2]
         layers, f = [], n_bins
         for i in range(3):
@@ -59,13 +61,18 @@ class NoteNet(nn.Module):
         self.proj = nn.Sequential(nn.Linear(ch[-1] * f, 256), nn.ReLU(), nn.Dropout(0.2))
         width = 256
         if context:
-            self.ctx = nn.Sequential(nn.Linear(2 * n_bins, 64), nn.ReLU())
+            self.ctx = nn.Sequential(nn.Linear(2 * n_bins * self.in_ch, 64), nn.ReLU())
             width += 64
         self.rnn = nn.GRU(width, hidden, num_layers=2, batch_first=True, bidirectional=True, dropout=0.2)
         self.out = nn.Linear(2 * hidden + width, self.n_out)
 
     def forward(self, x, profile=None):  # x: (B, T, F) normalised features; profile: (B, 2F)
-        h = self.conv(x.unsqueeze(1))                      # (B, C, T, F')
+        if self.in_ch > 1:  # (B, T, ch*F) -> (B, ch, T, F)
+            B, T, _ = x.shape
+            x = x.view(B, T, self.in_ch, -1).permute(0, 2, 1, 3)
+        else:
+            x = x.unsqueeze(1)
+        h = self.conv(x)                                   # (B, C, T, F')
         h = h.permute(0, 2, 1, 3).flatten(2)               # (B, T, C*F')
         h = self.proj(h)                                   # full time resolution
         if self.context:

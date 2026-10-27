@@ -26,6 +26,12 @@ KINDS = {
     # 22 kHz kinds can hear, which is what tells a hi-hat from a snare
     "drums_hq": [(4096, 128, 25.0, 20000.0)],
 }
+# several audio signals through the same banks, stacked as the model's input channels (stored
+# side by side in one array, channel after channel): stereo guitar = the middle of the guitar
+# mix (leads), its sides (doubled rhythm guitars panned left/right) and the keys stem (so the
+# model can tell keys from guitar)
+STACKS = {"guitar_st": ["mid", "side", "keys"]}
+KINDS["guitar_st"] = KINDS["guitar_hr"]
 RATES = {"drums_hq": 44100}  # kinds that need audio at a higher sample rate than SR
 _banks: dict = {}
 
@@ -46,7 +52,13 @@ def parts(kind: str) -> list:
 
 
 def n_bins(kind: str) -> int:
+    """Bins per input channel."""
     return sum(p[1] for p in parts(kind))
+
+
+def channels(kind: str) -> int:
+    """Input channels (audio signals) a kind stacks; 1 for ordinary kinds."""
+    return len(STACKS.get(kind, [None]))
 
 
 def _bank(part: tuple, device, sr: int = SR) -> torch.Tensor:
@@ -70,8 +82,10 @@ def _bank(part: tuple, device, sr: int = SR) -> torch.Tensor:
 
 
 def compute(wave: np.ndarray, kind: str, device="cuda") -> np.ndarray:
-    """wave: mono float32 at rate(kind) (SR for most kinds). Returns (frames, bins) float16
-    log-magnitudes at FPS frames per second."""
+    """wave: mono float32 at rate(kind) (SR for most kinds), or (channels, samples) for STACKS
+    kinds. Returns (frames, channels * bins) float16 log-magnitudes at FPS frames per second."""
+    if wave.ndim == 2:
+        return np.concatenate([compute(np.ascontiguousarray(w), kind, device) for w in wave], axis=1)
     x = torch.from_numpy(wave).to(device)
     sr, h = rate(kind), hop(kind)
     outs = []
