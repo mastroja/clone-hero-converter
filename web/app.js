@@ -356,6 +356,38 @@ async function renderStaging(reviewAll = false) {
 
 function closeDrawer() { $$(".scrim, .drawer").forEach((e) => e.remove()); }
 
+// how a chart plays, rated per part after playing it (friends too); the training runs read these
+const RATE = [["good", "Good"], ["ok", "OK"], ["bad", "Bad"]];
+function rateHTML(s) {
+  const parts = ["guitar", "bass", "drums"].filter((k) => s.tiers[k] !== "-1" && (s.tiers[k] || s.stems.includes(k)));
+  if (!parts.length) return "";
+  return `<div class="card"><h2>How does it play?</h2>
+    <p class="faint" style="margin-top:0">Played it? Rate each part. The next training runs use this to see what to fix.</p>
+    ${parts.map((k) => `<div class="row spread rate"><span>${k}</span><div class="tabs">${RATE.map(([v, l]) =>
+      `<button class="${s.ratings[k] === v ? "on" : ""}" data-rate="${k}" data-v="${v}">${l}</button>`).join("")}</div></div>`).join("")}
+    <div class="row" style="margin-top:12px;gap:8px"><input id="ratenote" class="grow" placeholder="What's off? e.g. solo too sparse, chorus wrong" value="${esc(s.rating_note || "")}">
+      <button class="btn small" id="savenote">Save</button></div>
+    <div class="faint" id="ratedby" style="margin-top:6px">${s.rated_by ? `Last rated by ${esc(s.rated_by)}` : ""}</div></div>`;
+}
+
+function wireRating(dr, s) {
+  const send = async (body) => {
+    const r = await post("/api/song/rating", { folder: s.folder, ...body });
+    Object.assign(s, { ratings: r.ratings, rating_note: r.rating_note, rated_by: r.rated_by });
+    $$("[data-rate]", dr).forEach((b) => b.classList.toggle("on", s.ratings[b.dataset.rate] === b.dataset.v));
+    $("#ratedby", dr).textContent = s.rated_by ? `Last rated by ${s.rated_by}` : "";
+  };
+  $$("[data-rate]", dr).forEach((b) => b.onclick = async () => {
+    const k = b.dataset.rate, v = s.ratings[k] === b.dataset.v ? "" : b.dataset.v;  // tap again to clear
+    try { await send({ inst: k, rating: v }); toast(v ? `${k}: ${v === "ok" ? "OK" : v}` : `${k} rating cleared`); } catch (e) { toast(e.message); }
+  });
+  const note = $("#ratenote", dr);
+  if (!note) return;
+  const saveNote = async () => { try { await send({ note: note.value }); toast("Note saved"); } catch (e) { toast(e.message); } };
+  $("#savenote", dr).onclick = saveNote;
+  note.onkeydown = (e) => { if (e.key === "Enter") saveNote(); };
+}
+
 async function openReview(folder, live = false) {
   closeDrawer();
   const scrim = document.createElement("div"); scrim.className = "scrim"; scrim.onclick = closeDrawer;
@@ -394,6 +426,7 @@ async function openReview(folder, live = false) {
     <div class="card"><h2>Listen</h2><div class="stems">
       ${stems.map((k) =>
         `<span>${k}</span><audio controls preload="none" src="/api/audio?${qs({ folder: s.folder, stem: k })}"></audio>`).join("")}</div></div>
+    ${!live || s.ours ? rateHTML(s) : ""}
     ${owner() ? `<div class="card"><h2>${live ? "Actions" : "Next"}</h2>
       ${live ? (s.ours ? `<div class="row wrap"><button class="btn" id="unpub">Move back to staging</button></div>` : "") : `<div class="row wrap">
         <button class="btn primary" id="pub">${ICON.rocket} Publish to live</button>
@@ -414,6 +447,7 @@ async function openReview(folder, live = false) {
     if (!confirm("Move this song back to staging? It leaves your live library (and the Deck after the next sync).")) return;
     try { await post("/api/live/unpublish", { folder: s.folder }); toast("Moved back to staging"); closeDrawer(); renderLive(); } catch (e) { toast(e.message); }
   };
+  if (!live || s.ours) wireRating(dr, s);
   if (!editable) { if (owner()) wireOpenPC(dr, s); return; }
   $("#editdet", dr).onclick = () => {
     const f = (id, label, val, type = "text") => `<div><label class="field">${label}</label><input id="${id}" type="${type}" value="${esc(val || "")}"></div>`;
@@ -484,14 +518,15 @@ async function renderLive() {
   $("#main").querySelector(".empty").outerHTML = `
     <div class="row wrap" style="margin-bottom:14px;gap:10px">
       <input id="lq" type="search" class="grow" placeholder="Search ${r.songs.length} songs by title, artist or album" value="${esc(liveQuery)}" style="min-width:200px">
-      <div class="tabs">${[["all", "All"], ["ours", "RockWizard"], ["human", "Human charts"], ["nocover", "No cover"]].map(([k, l]) =>
+      <div class="tabs">${[["all", "All"], ["ours", "RockWizard"], ["rate", "To rate"], ["human", "Human charts"], ["nocover", "No cover"]].map(([k, l]) =>
         `<button class="${liveFilter === k ? "on" : ""}" data-lf="${k}">${l}</button>`).join("")}</div>
       ${sortSelect("live")}
     </div>
     <div id="livegrid"></div>`;
   const draw = () => {
     const q = liveQuery.toLowerCase().trim();
-    const songs = sortSongs(r.songs, sortKey("live")).filter((s) => (liveFilter === "all" || (liveFilter === "ours" ? s.ours : liveFilter === "human" ? !s.ours : !s.has_cover))
+    const songs = sortSongs(r.songs, sortKey("live")).filter((s) => (liveFilter === "all" || (liveFilter === "ours" ? s.ours : liveFilter === "rate" ? s.ours && !Object.keys(s.ratings || {}).length
+        : liveFilter === "human" ? !s.ours : !s.has_cover))
       && (!q || `${s.title} ${s.artist} ${s.album} ${s.name}`.toLowerCase().includes(q)));
     $("#livegrid").innerHTML = songs.length ? `<div class="faint" style="margin-bottom:10px">${songs.length} song${songs.length === 1 ? "" : "s"}</div>
       <div class="songs">${songs.slice(0, liveShown).map((s) => `<div class="song" data-live="${esc(s.folder)}">${coverHTML(s)}

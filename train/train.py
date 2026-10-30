@@ -1,9 +1,13 @@
 """python -m train.train <kind> [--steps N] [--out models/x.pt] [--dm-frac 0.6]
-                           [--data v2|v3] [--dm-src ft|s6] [--rel]
+                           [--data v2|v3] [--dm-src ft|s6] [--rel] [--size] [--onset]
+                           [--focus 3] [--solo-frac 0.25] [--down 2]
 
 kind is the feature/model kind (guitar, guitar_hr, bass, bass_hr, drums, mix). --data v3 reads
 the song-id layout built by separate_v3 + feats_v3; --dm-src picks which Demucs model's stems
-to learn from (s6 = htdemucs_6s's real guitar stem); --rel adds up/same/down fret outputs."""
+to learn from (s6 = htdemucs_6s's real guitar stem); --rel adds up/same/down fret outputs.
+--focus weighs fast runs and guitar solos more in the loss (the most missed notes), --solo-frac
+starts that share of windows inside a solo, --onset adds a lane-free note-start output and
+--down sets how coarse in time the recurrent layer runs."""
 import argparse
 import time
 from pathlib import Path
@@ -14,9 +18,10 @@ from torch import nn as tnn
 
 from chc import features
 from chc import nn as cnn
-from . import data
+from . import charts, data
 
 WIN = 1024  # frames per training window (~12 s); overridden by --win
+FAST = 0.15  # seconds: notes closer than this to a neighbour count as a fast run (train.diagnose)
 
 
 def _in(t, t0, t1):
@@ -26,9 +31,14 @@ def _in(t, t0, t1):
 class Bank:
     """Memory-mapped features plus lazily built targets for a set of songs."""
 
-    def __init__(self, kind, items, path, n_out=None, context=False):
-        """path(i, song, kind) -> feature file."""
+    def __init__(self, kind, items, path, n_out=None, context=False, focus=1.0, solo_frac=0.0,
+                 onset=False):
+        """path(i, song, kind) -> feature file. focus: loss weight for frames in fast runs and
+        guitar solos; solo_frac: share of windows placed in a solo; onset: last output is a
+        lane-free note start."""
         self.kind, self.items = kind, items
+        self.focus, self.solo_frac, self.onset = focus, solo_frac, onset
+        self.solos = {}  # guitar solo sections (seconds) per song, from the chart's solo markers
         self.n_ch = n_out or len(cnn.CHANNELS[kind])
         self.n_lanes = cnn.n_lanes(kind)
         self.feats, self.stats, self.evs, self.attrs, self.dirs, self.sizes = {}, {}, {}, {}, {}, {}
@@ -52,14 +62,33 @@ class Bank:
                 self.dirs[i] = data.directions(s, kind)
             if self.n_ch > self.n_lanes + 5:
                 self.sizes[i] = data.chord_sizes(s, kind)
+            mid = Path(s["folder"]) / "notes.mid"
+            if (focus != 1.0 or solo_frac) and cnn.instrument(kind) == "guitar" and mid.exists():
+                try:
+                    spans = charts.solo_spans(mid, s.get("delay", 0.0))
+                except Exception:
+                    spans = []
+                if spans:
+                    self.solos[i] = spans
+        self.solo_items = [(i, s) for i, s in items if i in self.solos]
+        lengths = np.array([sum(b - a for a, b in self.solos[i]) for i, _ in self.solo_items], float)
+        self.solo_w = lengths / lengths.sum() if len(lengths) else None
         # sample songs in proportion to their length
         self.w = np.array([len(self.feats[i]) for i, _ in items], float)
         self.w /= self.w.sum()
 
     def window(self, rng):
-        i, s = self.items[rng.choice(len(self.items), p=self.w)]
-        f = self.feats[i]
-        a = int(rng.integers(0, max(1, len(f) - WIN)))
+        if self.solo_frac and self.solo_items and rng.random() < self.solo_frac:
+            # a window with a solo in it: solos are a small part of songs but the most missed notes
+            i, s = self.solo_items[rng.choice(len(self.solo_items), p=self.solo_w)]
+            f = self.feats[i]
+            s0, s1 = self.solos[i][rng.integers(len(self.solos[i]))]
+            at = int(rng.uniform(s0, s1) * features.FPS)
+            a = int(np.clip(at - rng.integers(0, WIN), 0, max(0, len(f) - WIN)))
+        else:
+            i, s = self.items[rng.choice(len(self.items), p=self.w)]
+            f = self.feats[i]
+            a = int(rng.integers(0, max(1, len(f) - WIN)))
         x = np.asarray(f[a:a + WIN], dtype=np.float32)
         m, sd = self.stats[i]
         x = (x - m) / sd
@@ -82,12 +111,29 @@ class Bank:
         if i in self.sizes:
             z = [(t - t0, c) for t, c in self.sizes[i] if _in(t, t0, t1)]
             y[:, nl + 5:nl + 8] = data.targets(z, len(x), 3)
+        starts = np.array(sorted({t for t, _ in ev}))
+        if self.onset:
+            y[:, -1] = data.targets([(t, 0) for t in starts], len(x), 1)[:, 0]
+        n = len(x)
         if len(x) < WIN:
             x = np.pad(x, ((0, WIN - len(x)), (0, 0)))
             y = np.pad(y, ((0, WIN - len(y)), (0, 0)))
         m = np.ones_like(y)  # which targets count towards the loss
         if i in self.no_cym_tom:
             m[:, 2:] = 0.0  # drums channels 2-7: yellow/blue/green, cymbal or tom
+        if self.focus != 1.0:
+            w = np.ones(len(m), np.float32)
+            if len(starts) > 1:
+                gap = np.diff(starts)
+                fast = np.r_[False, gap < FAST] | np.r_[gap < FAST, False]
+                for t in starts[fast]:
+                    fr = int(round(t * features.FPS))
+                    w[max(0, fr - 3): max(0, min(n, fr + 4))] = self.focus
+            for s0, s1 in self.solos.get(i, []):
+                lo, hi = max(0, int((s0 - t0) * features.FPS)), min(n, int((s1 - t0) * features.FPS))
+                if hi > lo:
+                    w[lo:hi] = self.focus
+            m *= w[:, None]
         return x, y, m, self.profiles.get(i, np.zeros(0, np.float32))
 
 
@@ -181,6 +227,14 @@ def main():
     ap.add_argument("--dm-src", choices=["ft", "s6"], default="ft")
     ap.add_argument("--rel", action="store_true", help="also learn up/same/down fret moves")
     ap.add_argument("--size", action="store_true", help="also learn how many frets each note has (needs --rel)")
+    ap.add_argument("--onset", action="store_true",
+                    help="also learn a lane-free note-start output, used for note times (needs --size)")
+    ap.add_argument("--focus", type=float, default=1.0,
+                    help="loss weight for fast runs and guitar solos (1 = like everything else)")
+    ap.add_argument("--solo-frac", type=float, default=0.0,
+                    help="share of guitar training windows placed inside a solo")
+    ap.add_argument("--down", type=int, default=cnn.DOWN,
+                    help="the recurrent layer runs at 1/down of the frame rate (smaller = finer timing)")
     ap.add_argument("--context", action="store_true",
                     help="also give the model the whole song's feature profile (its pitch range)")
     ap.add_argument("--save-every", type=int, default=1000,
@@ -214,16 +268,24 @@ def main():
         if not args.rel:
             raise SystemExit("--size needs --rel (the outputs come after the direction ones)")
         n_out += len(cnn.SIZE)
+    if args.onset:
+        if not args.size:
+            raise SystemExit("--onset needs --size (the output comes after the chord-size ones)")
+        n_out += len(cnn.ONSET)
     banks, weights = [], []
     if train_items:
-        banks.append(Bank(args.kind, train_items, layout.clean, n_out, args.context))
+        banks.append(Bank(args.kind, train_items, layout.clean, n_out, args.context, args.focus,
+                          args.solo_frac, args.onset))
         weights.append(1 - args.dm_frac if dm_items else 1.0)
     if dm_items and args.dm_frac > 0:
-        banks.append(Bank(args.kind, dm_items, layout.dm, n_out, args.context))
+        banks.append(Bank(args.kind, dm_items, layout.dm, n_out, args.context, args.focus,
+                          args.solo_frac, args.onset))
         weights.append(args.dm_frac if train_items else 1.0)
     weights = np.array(weights) / sum(weights)
     rng = np.random.default_rng(0)
-    model = cnn.NoteNet(args.kind, args.hidden, n_out, args.context).to(device)
+    if args.focus != 1.0 or args.solo_frac:
+        print(f"solo sections in {sum(len(b.solo_items) for b in banks)} training songs", flush=True)
+    model = cnn.NoteNet(args.kind, args.hidden, n_out, args.context, args.down).to(device)
     n_l = cnn.n_lanes(args.kind)
     print("params", sum(p.numel() for p in model.parameters()), flush=True)
     opt = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-2)
@@ -233,6 +295,8 @@ def main():
         pw[n_l], pw[n_l + 1] = 3.0, 1.0  # hammer-on flags are sparse; sustain spans are not
     if n_out > n_l + 2:
         pw[n_l + 2:] = 3.0
+    if args.onset:
+        pw[-1] = 6.0  # note starts are as sparse as the lanes' ones
     bce = tnn.BCEWithLogitsLoss(pos_weight=pw, reduction="none")
 
     def lossf(logits, y, m):
@@ -243,7 +307,8 @@ def main():
     def save(thr):
         torch.save({"state": model.state_dict(), "kind": args.kind, "thr": thr, "hidden": args.hidden,
                     "n_out": n_out, "data": args.data, "dm_src": args.dm_src, "rel": args.rel,
-                    "context": args.context, "size": args.size}, out)
+                    "context": args.context, "size": args.size, "onset": args.onset, "down": args.down,
+                    "focus": args.focus, "solo_frac": args.solo_frac}, out)
 
     # resumable snapshot: everything needed to carry on exactly where training stopped
     snap = out.with_name(out.stem + ".resume.pt")

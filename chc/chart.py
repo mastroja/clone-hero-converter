@@ -383,8 +383,9 @@ def write_mid(path: Path, bpm: float, offset: float, guitar=None, bass=None, dru
 
 def write_ini(path: Path, title: str, artist: str, charter: str, length_ms: int,
               parts: dict, preview_ms: int = 0, album: str = "", genre: str = "", year: str = "",
-              tiers: dict | None = None):
-    """tiers: {"guitar": 0-6, ...} difficulty shown in the song list (chc.rating); 2 if unknown."""
+              tiers: dict | None = None, models: str = ""):
+    """tiers: {"guitar": 0-6, ...} difficulty shown in the song list (chc.rating); 2 if unknown.
+    models: which model files charted it ("guitar:1a2b3c4d ..."; chc.ml.model_tag)."""
     tiers = tiers or {}
 
     def diff(inst):
@@ -397,4 +398,6 @@ def write_ini(path: Path, title: str, artist: str, charter: str, length_ms: int,
              "pro_drums = True", f"song_length = {length_ms}", "delay = 0",
              f"preview_start_time = {preview_ms}",
              "chc_generated = 1"]  # marks songs this app made (chc.library.is_ours)
+    if models:
+        lines.append(f"chc_models = {models}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

@@ -1,4 +1,5 @@
 """Learned note transcription: separated stem -> chart notes, using the trained models."""
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -10,10 +11,21 @@ MODEL_DIR = Path(__file__).resolve().parent.parent / "models"
 _cache: dict = {}
 _settings: dict = {}  # per-kind decoding thresholds saved in the model file
 _meta: dict = {}  # per-kind feature kind and expected stem source
+_tags: dict = {}  # (model file, mtime) -> fingerprint
 
 
 def available(kind: str) -> bool:
     return (MODEL_DIR / f"{kind}.pt").exists()
+
+
+def model_tag(kind: str) -> str:
+    """Short fingerprint of the model file (song.ini chc_models), so ratings of played charts
+    can be matched to the model that made them (train.feedback)."""
+    p = MODEL_DIR / f"{kind}.pt"
+    k = (str(p), p.stat().st_mtime)
+    if k not in _tags:
+        _tags[k] = hashlib.sha1(p.read_bytes()).hexdigest()[:8]
+    return _tags[k]
 
 
 def load(kind: str, device="cuda"):
@@ -24,7 +36,7 @@ def load(kind: str, device="cuda"):
         if fkind not in features.KINDS or nn.instrument(fkind) != nn.instrument(kind):
             fkind = kind
         n_out = ck.get("n_out") or ck["state"]["out.weight"].shape[0]  # older models have 5 outputs
-        m = nn.NoteNet(fkind, ck.get("hidden", 128), n_out, ck.get("context", False)).to(device)
+        m = nn.NoteNet(fkind, ck.get("hidden", 128), n_out, ck.get("context", False), ck.get("down", nn.DOWN)).to(device)
         m.load_state_dict(ck["state"])
         m.eval()
         _cache[kind] = (m, ck.get("thr", 0.4))
@@ -142,7 +154,8 @@ def decode_fretted(kind: str, prob: np.ndarray, thr=0.35, ratios=None, hopo=0.5,
     Models with up/same/down outputs then re-place frets along the melody (follow_directions).
     Models with chord-size outputs choose how many frets each note gets from those instead
     (size_bias scales the 2- and 3-fret chances, tuned so chords are as common as in real charts),
-    then take that many of the likeliest lanes.
+    then take that many of the likeliest lanes. Models with an onset output (after those) take
+    note times from it instead of the strongest lane.
     """
     ratios = ratios or CHORD_RATIO[kind]
     hopo_thr, sus_thr = hopo, sus
@@ -151,7 +164,7 @@ def decode_fretted(kind: str, prob: np.ndarray, thr=0.35, ratios=None, hopo=0.5,
     has_rel = prob.shape[1] >= 10
     has_size = prob.shape[1] >= 13
     bias = np.array([1.0, *size_bias])
-    onset = lanes_p.max(axis=1, keepdims=True)
+    onset = prob[:, 13:14] if prob.shape[1] >= 14 else lanes_p.max(axis=1, keepdims=True)
     frames = [fr for fr, _, _ in nn.pick(onset, thr)]
     out, segs, rels = [], [], []
     for k, fr in enumerate(frames):

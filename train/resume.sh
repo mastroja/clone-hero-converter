@@ -1,5 +1,5 @@
 #!/bin/bash
-# Resume (or start) a v3 run: bash train/resume.sh a|b   (a = part 1, b = part 2)
+# Resume (or start) a v3 run: bash train/resume.sh a|b|...|f   (a = part 1 ... f = part 6)
 # Finished steps are skipped and a paused training run continues from its last snapshot.
 # Runs in the foreground; launch it detached (e.g. Start-Process) to keep it going.
 cd "$(dirname "$0")/.."

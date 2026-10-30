@@ -5,7 +5,7 @@ from torch import nn
 
 from . import features
 
-DOWN = 4  # the recurrent layer runs at 1/4 of the frame rate
+DOWN = 4  # the recurrent layer runs at 1/4 of the frame rate (train --down picks another)
 
 # output channels per instrument; guitar/bass add a hammer-on flag (at the note) and a
 # sustain-held channel (on while a sustain rings) after the five lanes
@@ -27,6 +27,9 @@ REL = ["up", "same", "down"]
 # optional extra outputs after those (train --size): how many frets the note has (1, 2, 3+);
 # chord size was the biggest guitar error when chords were picked from the lane outputs alone
 SIZE = ["1 fret", "2 frets", "3 frets"]
+# optional last output (train --onset, after those): a note starts here, whatever its frets.
+# Note times otherwise come from the strongest lane, which blurs in fast runs that change lanes.
+ONSET = ["onset"]
 
 
 def instrument(kind: str) -> str:
@@ -40,11 +43,14 @@ def n_lanes(kind: str) -> int:
 
 
 class NoteNet(nn.Module):
-    def __init__(self, kind: str, hidden: int = 128, n_out: int | None = None, context: bool = False):
+    def __init__(self, kind: str, hidden: int = 128, n_out: int | None = None, context: bool = False,
+                 down: int = DOWN):
         """context: also take the whole song's feature profile (features.song_profile) next to
-        every window, so the model knows where the music sits in the song's range."""
+        every window, so the model knows where the music sits in the song's range.
+        down: the recurrent layer runs at 1/down of the frame rate."""
         super().__init__()
         self.kind = kind
+        self.down = down
         self.n_out = n_out or len(CHANNELS[kind])
         self.context = context
         n_bins = features.n_bins(kind)
@@ -79,11 +85,11 @@ class NoteNet(nn.Module):
             c = self.ctx(profile)[:, None, :].expand(-1, h.shape[1], -1)
             h = torch.cat([h, c], dim=-1)
         T = h.shape[1]
-        pad = (-T) % DOWN
+        pad = (-T) % self.down
         hp = nn.functional.pad(h, (0, 0, 0, pad))
-        ctx = nn.functional.avg_pool1d(hp.transpose(1, 2), DOWN).transpose(1, 2)
-        ctx, _ = self.rnn(ctx)                             # long-range context at 1/DOWN rate
-        ctx = ctx.repeat_interleave(DOWN, dim=1)[:, :T]
+        ctx = nn.functional.avg_pool1d(hp.transpose(1, 2), self.down).transpose(1, 2)
+        ctx, _ = self.rnn(ctx)                             # long-range context at 1/down rate
+        ctx = ctx.repeat_interleave(self.down, dim=1)[:, :T]
         return self.out(torch.cat([ctx, h], dim=-1))       # logits (B, T, n_out)
 
 

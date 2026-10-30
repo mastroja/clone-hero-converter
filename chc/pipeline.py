@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import analysis, audio, chart, ml, rating, structure
+from . import analysis, audio, chart, feedback, ml, rating, structure
 
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 STEM_TO_CH = {"other": "guitar", "bass": "bass", "drums": "drums", "vocals": "vocals"}
@@ -129,9 +129,10 @@ def write_chart(song_dir: Path, c: dict, title: str, artist: str, charter: str, 
     tiers = {k: rating.tier(k, c[k]) for k in ("guitar", "bass", "drums") if c[k]}
     if preview_ms is None:
         preview_ms = int(min(30, max(0, length - 40)) * 1000)
+    models = " ".join(f"{k}:{ml.model_tag(k)}" for k in ("guitar", "bass", "drums") if c[k] and ml.available(k))
     chart.write_ini(song_dir / "song.ini", title, artist, charter, int(length * 1000), counts,
                     preview_ms=preview_ms, album=d.album if d else "", genre=d.genre if d else "",
-                    year=d.year if d else "", tiers=tiers)
+                    year=d.year if d else "", tiers=tiers, models=models)
     return counts
 
 
@@ -180,9 +181,10 @@ def update_song(song_dir: Path, on_step=lambda i: None, on_progress=lambda frac:
             preview = None
         write_chart(song_dir, c, ini.get("name", song_dir.name), ini.get("artist", ""),
                     ini.get("charter", ""), length, d, preview)
-        # fields write_chart doesn't write (review status, who added the song, ...) are kept
+        # fields write_chart doesn't write (review status, who added the song, ...) are kept,
+        # except ratings: they were about the old chart (data/feedback.jsonl keeps them)
         new = library.tidy.read_ini(song_dir)
-        library.tidy.write_ini(song_dir, {k: v for k, v in ini.items() if k not in new})
+        library.tidy.write_ini(song_dir, {k: v for k, v in ini.items() if k not in new and not feedback.is_rating_key(k)})
         on_progress(1.0)
         return saved
     finally:

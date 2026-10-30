@@ -21,16 +21,6 @@ from chc import nn as cnn
 from . import charts, data, metrics
 
 
-def solo_spans(path: Path, delay: float):
-    """Guitar solo sections marked in the chart (note 103), in seconds."""
-    mid = mido.MidiFile(str(path), clip=True)
-    tm = charts.TempoMap(mid)
-    for tr in mid.tracks:
-        if tr.name.strip().upper() == "PART GUITAR":
-            return [(tm.sec(a) + delay, tm.sec(b) + delay) for a, n, b in charts._notes(tr) if n == 103]
-    return []
-
-
 def has_keys(path: Path) -> bool:
     return any(tr.name.strip().upper() in ("PART KEYS", "PART REAL_KEYS_X") for tr in mido.MidiFile(str(path), clip=True).tracks)
 
@@ -100,8 +90,9 @@ def main():
             sid = data.song_id(s)
             paths = {"clean": data.V3 / "feats" / f"{sid}_clean_{fkind}.npy",
                      "demucs": data.V3 / "feats" / f"{sid}_ft_{fkind}.npy"}
-            if not all(p.exists() for p in paths.values()):
-                continue
+            mid = Path(s["folder"]) / "notes.mid"
+            if not all(p.exists() for p in paths.values()) or not mid.exists():
+                continue  # also skips songs renamed or removed from the library since indexing
             gt = [(n[0], tuple(n[1])) for n in s["notes"][inst]]
             preds = {}
             for name, p in paths.items():
@@ -110,9 +101,8 @@ def main():
                 add(tot[name], breakdown(preds[name], gt))
                 add(shape[name], metrics.contour(preds[name], gt))
             pred = preds["demucs"]
-            mid = Path(s["folder"]) / "notes.mid"
             if inst == "guitar":
-                spans = solo_spans(mid, s.get("delay", 0.0))
+                spans = charts.solo_spans(mid, s.get("delay", 0.0))
                 in_solo = lambda t: any(a <= t < b for a, b in spans)
                 mp = np.array([in_solo(p[0]) for p in pred])
                 mg = np.array([in_solo(g[0]) for g in gt])

@@ -26,7 +26,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import library, pipeline, review, search, startup, tidy
+from . import feedback, library, pipeline, review, search, startup, tidy
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB = ROOT / "web"
@@ -217,6 +217,14 @@ def added_by(request: Request) -> str:
     """The friend's name to tag new songs with, or "" for the owner."""
     d = device_of(request)
     return "" if d is None or d.get("owner") else (d.get("name") or "a friend")
+
+
+def rater(request: Request) -> str:
+    """Who is rating a chart: the device's name (the PC is the owner)."""
+    d = device_of(request)
+    if d is None:
+        return (cfg.get("owner_names") or ["owner"])[0]
+    return d.get("name") or "a friend"
 
 
 def require_owner(request: Request):
@@ -477,7 +485,7 @@ def song_summary(folder: Path, with_review=False) -> dict:
             "cover_v": max((int((folder / n).stat().st_mtime) for n in ("album.jpg", "album.png") if (folder / n).exists()), default=0),
             "genre": ini.get("genre", ""), "charter": ini.get("charter", ""), "added_by": ini.get("chc_added_by", ""),
             "stems": [p.stem for p in folder.iterdir() if p.suffix.lower() in (".ogg", ".opus", ".mp3")],
-            "modified": mtime, "verdict": r["verdict"] if r else None}
+            "modified": mtime, "verdict": r["verdict"] if r else None} | feedback.of(ini)
 
 
 @app.get("/api/staging")
@@ -687,6 +695,24 @@ async def song_details_set(req: Request):
         if str(new) != str(f):
             _reviews.pop(str(f), None)
             f = new
+    return song_summary(f)
+
+
+@app.post("/api/song/rating")
+async def song_rating(req: Request):
+    """How a RockWizard chart plays, from anyone who played it (friends too): one part's rating
+    (inst + rating, "" clears it) and/or a note on what's off."""
+    b = await req.json()
+    f = our_song(b["folder"])
+    roots = [r.resolve() for r in (staging_dir(), live_dir()) if r]
+    if not any(f.resolve().is_relative_to(r) for r in roots):  # friends rate; keep them to the libraries
+        raise HTTPException(403, "Only songs in staging or Quickplay can be rated")
+    inst, value, note = b.get("inst"), b.get("rating") or "", b.get("note")
+    if inst is not None and (inst not in feedback.INSTRUMENTS or value not in (*feedback.RATINGS, "")):
+        raise HTTPException(400, "Unknown rating")
+    if note is not None:
+        note = " ".join(str(note).split())[:300]  # one line in song.ini
+    feedback.rate(f, rater(req), inst, value, note)
     return song_summary(f)
 
 

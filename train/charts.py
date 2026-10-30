@@ -58,6 +58,16 @@ def _notes(track):
     return out
 
 
+def solo_spans(path: Path, delay: float = 0.0) -> list[tuple[float, float]]:
+    """Guitar solo sections marked in a notes.mid (note 103), in seconds."""
+    mid = mido.MidiFile(str(path), clip=True)
+    tm = TempoMap(mid)
+    for tr in mid.tracks:
+        if tr.name.strip().upper() == "PART GUITAR":
+            return [(tm.sec(a) + delay, tm.sec(b) + delay) for a, n, b in _notes(tr) if n == 103]
+    return []
+
+
 def parse_mid(path: Path) -> dict:
     """Return {'guitar': [(t, lanes)], 'bass': [...], 'drums': [(t, lane, tom)], 'five_lane': bool}.
 
